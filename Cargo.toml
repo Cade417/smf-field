@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = ["crates/*", "xtask"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+# Why shared deps: egui, eframe and wgpu must move as a set. Only eframe::wgpu
+# is used by the app so two wgpu versions can never end up linked.
+[workspace.dependencies]
+smf-geo = { path = "crates/smf-geo" }
+smf-tiles = { path = "crates/smf-tiles" }
+smf-terrain = { path = "crates/smf-terrain" }
+smf-render = { path = "crates/smf-render" }
+smf-features = { path = "crates/smf-features" }
+smf-io = { path = "crates/smf-io" }
+smf-print = { path = "crates/smf-print" }
+smf-data = { path = "crates/smf-data" }
+eframe = { version = "0.36", default-features = false, features = ["wgpu", "default_fonts", "wayland", "x11", "accesskit"] }
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+directories = "6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"
+naga = { version = "30", features = ["wgsl-in"] }
+proptest = "1"
+
+[workspace.lints.clippy]
+all = "warn"

@@ -1,0 +1,28 @@
+[package]
+name = "smf-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "smf-field"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+smf-geo.workspace = true
+smf-tiles.workspace = true
+smf-terrain.workspace = true
+smf-render.workspace = true
+smf-features.workspace = true
+smf-io.workspace = true
+smf-print.workspace = true
+smf-data.workspace = true
+eframe.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+directories.workspace = true
