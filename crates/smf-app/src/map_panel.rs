@@ -7,6 +7,7 @@ use crate::layers::LayerStore;
 use crate::layers_ui::{ActiveDownload, DownloadUi, OverlayLayer};
 use crate::print_ui::PrintUi;
 use crate::smf_ui::SmfState;
+use crate::trails_ui::TrailState;
 use crate::w3w_ui::W3wState;
 use crate::{overlay, panels};
 use directories::ProjectDirs;
@@ -131,6 +132,7 @@ pub struct MapPanel {
     pub(crate) smf: SmfState,
     pub(crate) w3w: W3wState,
     pub(crate) ext: ExtState,
+    pub(crate) trails: TrailState,
     /// SMF_COND verification hook: query conditions here on the first frame.
     pub dev_conditions: Option<LngLat>,
     pub(crate) cache_dir: std::path::PathBuf,
@@ -207,6 +209,7 @@ impl MapPanel {
             smf: SmfState::new(&cc.egui_ctx),
             w3w: W3wState::new(),
             ext: ExtState::new(),
+            trails: TrailState::new(),
             dev_conditions: None,
             cache_dir,
         };
@@ -277,6 +280,8 @@ impl MapPanel {
         self.poll_smf(ui.ctx());
         self.poll_w3w(ui.ctx());
         self.poll_ext(ui.ctx());
+        self.poll_trails(ui.ctx());
+        self.trails_dev(editor);
         if let Some(ll) = self.dev_conditions.take() {
             self.query_conditions(ll, ui.ctx());
         }
@@ -918,7 +923,9 @@ impl MapPanel {
                 if !shift && let Some(s) = snap(&editor.project, &project, pt, tol) {
                     ll = s;
                 }
-                editor.click(ll);
+                let tol_m =
+                    (meters_per_pixel(self.view.center.lat, self.view.zoom) * tol * 1.5).max(12.0);
+                self.click_snapped(editor, ll, if terrain { 30.0 } else { tol_m });
             }
         } else if resp.double_clicked()
             && editor.tool == Tool::Select
@@ -1007,6 +1014,10 @@ impl MapPanel {
         };
         if self.coord_format == CoordFormat::W3w || self.w3w.grid_on || self.w3w.found.is_some() {
             attribution.push_str(" | what3words");
+        }
+        if let Some(c) = self.trails_credit() {
+            attribution.push_str(" | ");
+            attribution.push_str(c);
         }
         if let Some(c) = self.ext_credit() {
             attribution.push_str(" | ");

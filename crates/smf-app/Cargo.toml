@@ -23,6 +23,7 @@ smf-print.workspace = true
 smf-data.workspace = true
 smf-w3w.workspace = true
 smf-ext.workspace = true
+smf-route.workspace = true
 eframe.workspace = true
 anyhow.workspace = true
 tracing.workspace = true

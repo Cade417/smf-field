@@ -4108,6 +4108,7 @@ dependencies = [
  "smf-io",
  "smf-print",
  "smf-render",
+ "smf-route",
  "smf-terrain",
  "smf-tiles",
  "smf-w3w",
@@ -4203,6 +4204,15 @@ dependencies = [
  "smf-terrain",
  "tracing",
  "wgpu",
+]
+
+[[package]]
+name = "smf-route"
+version = "0.1.0"
+dependencies = [
+ "reqwest",
+ "serde_json",
+ "smf-geo",
 ]
 
 [[package]]

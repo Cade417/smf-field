@@ -113,7 +113,7 @@ impl ExtState {
 }
 
 /// True when the new view still lies well inside the area already fetched at about the same scale.
-pub fn covers(fetched: ([f64; 4], f64), want: [f64; 4], zoom: f64) -> bool {
+pub(crate) fn covers(fetched: ([f64; 4], f64), want: [f64; 4], zoom: f64) -> bool {
     let (f, fz) = fetched;
     (zoom - fz).abs() < 1.0
         && want[0] >= f[0]
@@ -122,7 +122,7 @@ pub fn covers(fetched: ([f64; 4], f64), want: [f64; 4], zoom: f64) -> bool {
         && want[3] <= f[3]
 }
 
-fn grow(b: [f64; 4], k: f64) -> [f64; 4] {
+pub(crate) fn grow(b: [f64; 4], k: f64) -> [f64; 4] {
     let (cx, cy) = ((b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0);
     let (hx, hy) = ((b[2] - b[0]) / 2.0 * k, (b[3] - b[1]) / 2.0 * k);
     [cx - hx, cy - hy, cx + hx, cy + hy]
@@ -146,9 +146,10 @@ impl MapPanel {
         ui.separator();
         ui.weak("Details: click a perimeter or gauge.");
         if let Some(s) = &self.ext.status {
-            ui.separator();
             ui.label(s);
         }
+        ui.separator();
+        self.trails_menu(ui);
     }
 
     /// Visible ground area as [west, south, east, north] (2D), or a box around the 3D target.
