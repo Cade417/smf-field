@@ -25,13 +25,61 @@ max_zoom = 16
 attribution = "USGS The National Map"
 offline_allowed = true
 
+# Missouri statewide 2023/2024 aerial imagery at 6 inches (0.15 m) per pixel, from the state's
+# public MSDIS server (no account). The cached copy is in UTM 15N, so tiles come from the dynamic
+# service over WMS in Web Mercator. JPEG keeps tiles small (~10 KB vs ~180 KB as PNG); the cost is
+# that areas outside Missouri come back black.
+[[source]]
+id = "msdis-6inch"
+name = "Missouri 6-inch Imagery 2023/24 (MSDIS)"
+url = "https://stateimagery.msdis.missouri.edu/arcgis/services/Missouri_6inch_Statewide_2023_2024_Dynamic/ImageServer/WMSServer"
+max_zoom = 20
+attribution = "Imagery: Missouri Spatial Data Information Service (MSDIS)"
+offline_allowed = true
+
+[source.backend]
+type = "wms"
+layers = "Missouri_6inch_Statewide_2023_2024_Dynamic"
+format = "image/jpeg"
+transparent = false
+version = "1.3.0"
+
+# Esri's US coverage reaches z20 (in Missouri it is the same 6-inch state imagery as above).
 [[source]]
 id = "esri-imagery"
 name = "Esri World Imagery"
 url = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
-max_zoom = 19
-attribution = "Esri, Maxar, Earthstar Geographics"
+max_zoom = 20
+attribution = "Esri, Vantor, Earthstar Geographics"
 offline_allowed = false
+
+# Esri's sharper, less-processed imagery (often a different capture date from World Imagery, so
+# switching between the two can show changes). Same terms as World Imagery; tiles stop at z19.
+[[source]]
+id = "esri-clarity"
+name = "Esri Clarity Imagery"
+url = "https://clarity.maptiles.arcgis.com/arcgis/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
+max_zoom = 19
+attribution = "Esri, Vantor, Earthstar Geographics"
+offline_allowed = false
+
+# USDA NAIP (0.6 m, public domain) as color infrared: healthy vegetation shows red and burned or
+# bare ground dark, which makes burn scars and fuel breaks stand out. The USGS server renders it on
+# demand, so tiles can take several seconds.
+[[source]]
+id = "naip-cir"
+name = "NAIP Color Infrared (USDA, slow)"
+url = "https://imagery.nationalmap.gov/arcgis/services/USGSNAIPImagery/ImageServer/WMSServer"
+max_zoom = 18
+attribution = "USDA NAIP via USGS The National Map"
+offline_allowed = true
+
+[source.backend]
+type = "wms"
+layers = "USGSNAIPImagery:FalseColorComposite"
+format = "image/jpeg"
+transparent = false
+version = "1.3.0"
 
 [[source]]
 id = "opentopomap"
@@ -48,6 +96,26 @@ name = "OpenStreetMap"
 url = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
 max_zoom = 19
 attribution = "OpenStreetMap contributors"
+offline_allowed = false
+
+# Overlays for imagery (Layers > Add overlay): place names, boundaries and roads, so any imagery
+# basemap can be shown like a "hybrid" map. Esri terms: viewing only, no bulk download.
+[[source]]
+id = "esri-labels"
+overlay = true
+name = "Places and boundaries (Esri)"
+url = "https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}"
+max_zoom = 19
+attribution = "Esri, HERE, Garmin, OpenStreetMap contributors"
+offline_allowed = false
+
+[[source]]
+id = "esri-roads"
+overlay = true
+name = "Roads (Esri)"
+url = "https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Transportation/MapServer/tile/{z}/{y}/{x}"
+max_zoom = 19
+attribution = "Esri, HERE, Garmin, OpenStreetMap contributors"
 offline_allowed = false
 
 # Elevation (not a basemap): Mapzen/AWS open terrain tiles, Terrarium-encoded, a composite of

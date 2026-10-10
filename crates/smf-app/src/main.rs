@@ -898,7 +898,7 @@ impl FieldApp {
             ui.separator();
             ui.label(egui::RichText::new("Credits").strong());
             ui.label("Fire data, conditions and forecast: Show Me Fire (showmefire.org).");
-            ui.label("Basemaps: USGS The National Map, Esri, OpenStreetMap contributors, OpenTopoMap.");
+            ui.label("Basemaps: USGS The National Map, USDA NAIP, Missouri Spatial Data Information Service (MSDIS), Esri, OpenStreetMap contributors, OpenTopoMap.");
             ui.label("Terrain: Mapzen, USGS 3DEP, SRTM and other open elevation sources.");
             ui.label("Built with Rust, wgpu and egui.");
             ui.separator();

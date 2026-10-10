@@ -6,7 +6,8 @@ not a monorepo).
 
 ## What it does
 
-- **Maps**: USGS Topo / Imagery / Imagery+Topo, Esri World Imagery, OpenTopoMap, OSM; smooth pan,
+- **Maps**: USGS Topo / Imagery / Imagery+Topo, Missouri 6-inch statewide imagery (MSDIS),
+  Esri World Imagery and Clarity, NAIP color infrared, OpenTopoMap, OSM; Esri places/roads overlays; smooth pan,
   zoom-to-cursor, rotation, inertia; coordinates in DD / DMS / UTM; geodesic scale bar.
 - **3D terrain**: quadtree-LOD terrain draped with any basemap or overlay, hillshade, slope-angle
   shading (degrees or fire-grade percent presets), vertical exaggeration, elevation readout and

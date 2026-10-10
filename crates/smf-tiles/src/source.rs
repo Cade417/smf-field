@@ -219,7 +219,14 @@ mod tests {
     fn catalog_parses_and_flags_restricted() {
         let s = default_sources();
         assert!(s.len() >= 6);
-        for id in ["osm", "opentopomap", "esri-imagery"] {
+        for id in [
+            "osm",
+            "opentopomap",
+            "esri-imagery",
+            "esri-clarity",
+            "esri-labels",
+            "esri-roads",
+        ] {
             assert!(
                 !s.iter().find(|x| x.id == id).unwrap().offline_allowed,
                 "{id}"
@@ -246,5 +253,20 @@ mod tests {
             ..usgs.clone()
         };
         assert_eq!(tms.tile_url(t), "x/5/7/19");
+        // WMS imagery from the catalog: requested per tile in Web Mercator.
+        let mo = s.iter().find(|x| x.id == "msdis-6inch").unwrap();
+        let u = mo.tile_url(t);
+        assert!(u.contains("/WMSServer?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS=Missouri_6inch_Statewide_2023_2024_Dynamic&"), "{u}");
+        assert!(u.contains("&CRS=EPSG:3857&") && u.contains("FORMAT=image/jpeg"));
+        let cir = s.iter().find(|x| x.id == "naip-cir").unwrap();
+        assert!(
+            cir.tile_url(t)
+                .contains("LAYERS=USGSNAIPImagery:FalseColorComposite&")
+        );
+        // Reference layers are overlays, never offered as basemaps.
+        for id in ["esri-labels", "esri-roads"] {
+            assert!(s.iter().find(|x| x.id == id).unwrap().overlay, "{id}");
+        }
+        assert!(!mo.overlay && !cir.overlay);
     }
 }
