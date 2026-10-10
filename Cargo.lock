@@ -4102,6 +4102,7 @@ dependencies = [
  "serde",
  "serde_json",
  "smf-data",
+ "smf-ext",
  "smf-features",
  "smf-geo",
  "smf-io",
@@ -4127,6 +4128,17 @@ dependencies = [
  "smf-tiles",
  "thiserror 2.0.21",
  "tracing",
+]
+
+[[package]]
+name = "smf-ext"
+version = "0.1.0"
+dependencies = [
+ "reqwest",
+ "serde_json",
+ "smf-data",
+ "smf-features",
+ "smf-geo",
 ]
 
 [[package]]

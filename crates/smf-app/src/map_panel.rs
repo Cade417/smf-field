@@ -2,6 +2,7 @@
 //! and overlays. The renderer draws offscreen; the texture is shown as an egui
 //! image with egui-painted features and chrome on top.
 
+use crate::ext_ui::ExtState;
 use crate::layers::LayerStore;
 use crate::layers_ui::{ActiveDownload, DownloadUi, OverlayLayer};
 use crate::print_ui::PrintUi;
@@ -129,6 +130,7 @@ pub struct MapPanel {
     pub(crate) print: PrintUi,
     pub(crate) smf: SmfState,
     pub(crate) w3w: W3wState,
+    pub(crate) ext: ExtState,
     /// SMF_COND verification hook: query conditions here on the first frame.
     pub dev_conditions: Option<LngLat>,
     pub(crate) cache_dir: std::path::PathBuf,
@@ -204,6 +206,7 @@ impl MapPanel {
             print: PrintUi::default(),
             smf: SmfState::new(&cc.egui_ctx),
             w3w: W3wState::new(),
+            ext: ExtState::new(),
             dev_conditions: None,
             cache_dir,
         };
@@ -273,6 +276,7 @@ impl MapPanel {
         self.poll_downloads();
         self.poll_smf(ui.ctx());
         self.poll_w3w(ui.ctx());
+        self.poll_ext(ui.ctx());
         if let Some(ll) = self.dev_conditions.take() {
             self.query_conditions(ll, ui.ctx());
         }
@@ -295,6 +299,7 @@ impl MapPanel {
                 self.set_mode(want);
                 ui.menu_button("Show Me Fire", |ui| self.smf_menu(ui, editor));
                 ui.menu_button("Layers", |ui| self.layers_menu(ui));
+                ui.menu_button("Fire & snow", |ui| self.ext_menu(ui));
                 ui.menu_button("Offline", |ui| self.offline_menu(ui));
                 ui.menu_button("Shading", |ui| self.shading_menu(ui));
                 self.w3w_toolbar(ui, editor);
@@ -344,12 +349,36 @@ impl MapPanel {
             self.pending_fit = Some(b);
         }
 
+        // Vertical gain along the measured line, once its elevation tiles are loaded.
+        let measure_gain = if editor.measure.len() >= 2 {
+            let path = editor.measure.clone();
+            for id in smf_terrain::profile_tiles(&path, 12) {
+                if !self.heights.contains(id) {
+                    self.request_terrain_tile(id, -5.0);
+                }
+            }
+            let p = smf_terrain::elevation_profile(&self.heights, &path, 160);
+            (p.coverage > 0.0).then(|| {
+                format!(
+                    "Gain +{:.0} m / Loss -{:.0} m{}",
+                    p.gain_m,
+                    p.loss_m,
+                    if p.coverage < 1.0 { " (loading)" } else { "" }
+                )
+            })
+        } else {
+            None
+        };
         egui::Panel::bottom("status").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(tool_hint(editor));
                 if let Some(m) = overlay::measure_summary(editor) {
                     ui.separator();
                     ui.label(egui::RichText::new(m).strong());
+                }
+                if let Some(g) = &measure_gain {
+                    ui.separator();
+                    ui.label(egui::RichText::new(g).strong());
                 }
                 if self.work_offline {
                     ui.separator();
@@ -487,6 +516,7 @@ impl MapPanel {
             },
         };
         self.draw_smf_data(&painter, &pj, rect);
+        self.draw_ext(&painter, &pj, rect);
         self.draw_w3w(&painter, &pj, rect);
         overlay::draw_project(&painter, &pj, editor);
         let proj = self.proj();
@@ -877,6 +907,11 @@ impl MapPanel {
                         editor.selection = None;
                         // Nothing of the user's under the pointer: offer live Show Me Fire data instead.
                         self.smf.info = Self::smf_pick(&self.smf, &project, pt, tol);
+                        if self.smf.info.is_none()
+                            && let Some(t) = Self::ext_pick(&self.ext, &project, pt, tol)
+                        {
+                            self.notice = Some((t, Instant::now()));
+                        }
                     }
                 }
             } else if let Some(mut ll) = proj.unproject(pt) {
@@ -972,6 +1007,10 @@ impl MapPanel {
         };
         if self.coord_format == CoordFormat::W3w || self.w3w.grid_on || self.w3w.found.is_some() {
             attribution.push_str(" | what3words");
+        }
+        if let Some(c) = self.ext_credit() {
+            attribution.push_str(" | ");
+            attribution.push_str(&c);
         }
         pill(
             attribution,

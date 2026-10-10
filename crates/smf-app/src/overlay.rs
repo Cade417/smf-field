@@ -266,13 +266,24 @@ pub fn draw_data_feature(
     f: &smf_data::DataFeature,
     visible: egui::Rect,
 ) {
-    let col = color(f.style.color);
-    match &f.geometry {
+    draw_data_shape(painter, pj, &f.geometry, &f.style, visible);
+}
+
+/// Markers and filled outlines for any read-only data layer (Show Me Fire, fire history, snow gauges).
+pub fn draw_data_shape(
+    painter: &Painter,
+    pj: &Projector,
+    geometry: &Geometry,
+    style: &smf_data::DataStyle,
+    visible: egui::Rect,
+) {
+    let col = color(style.color);
+    match geometry {
         Geometry::Marker(p) => {
             let Some(c) = pj.pos(*p).filter(|c| visible.contains(*c)) else {
                 return;
             };
-            let r = f.style.radius.max(2.5);
+            let r = style.radius.max(2.5);
             painter.circle_filled(c, r + 1.6, Color32::WHITE);
             painter.circle_filled(c, r, col);
             if r >= 6.0 {
@@ -300,15 +311,15 @@ pub fn draw_data_feature(
                     painter,
                     &pts,
                     Color32::from_rgba_unmultiplied(
-                        f.style.color[0],
-                        f.style.color[1],
-                        f.style.color[2],
-                        f.style.fill_alpha,
+                        style.color[0],
+                        style.color[1],
+                        style.color[2],
+                        style.fill_alpha,
                     ),
                 );
             }
             for seg in segs {
-                painter.add(Shape::line(seg, Stroke::new(f.style.width, col)));
+                painter.add(Shape::line(seg, Stroke::new(style.width, col)));
             }
         }
         _ => {}
