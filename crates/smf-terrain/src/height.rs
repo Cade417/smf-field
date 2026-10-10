@@ -5,6 +5,8 @@ use std::sync::Arc;
 /// Terrarium tiles stop at z15 (~4.8 m/px at the equator); deeper views reuse these.
 pub const TERRAIN_MAX_ZOOM: u8 = 15;
 const TILE_PX: usize = 256;
+/// Half-width of the slope stencil: about the native resolution of the 10-30 m DEM underneath.
+const SLOPE_STEP_M: f64 = 15.0;
 /// Memory cap for the CPU copy of heights: 600 tiles * 256 KB = ~150 MB.
 const MAX_TILES: usize = 600;
 
@@ -86,6 +88,22 @@ impl HeightField {
         None
     }
 
+    /// Terrain slope (degrees from horizontal) and aspect (compass bearing the slope faces,
+    /// i.e. the downhill direction, 0 = north) at a point, from central differences over
+    /// `SLOPE_STEP_M`. None where any needed sample is not loaded yet.
+    pub fn slope_aspect(&self, p: LngLat) -> Option<(f64, f64)> {
+        let dlat = SLOPE_STEP_M / 111_320.0;
+        let dlng = dlat / p.lat.to_radians().cos().max(0.05);
+        let at = |dx: f64, dy: f64| self.sample(LngLat::new(p.lng + dx, p.lat + dy));
+        let (e, w) = (at(dlng, 0.0)?, at(-dlng, 0.0)?);
+        let (n, s) = (at(0.0, dlat)?, at(0.0, -dlat)?);
+        let dz_dx = (e - w) as f64 / (2.0 * SLOPE_STEP_M);
+        let dz_dy = (n - s) as f64 / (2.0 * SLOPE_STEP_M);
+        let slope = dz_dx.hypot(dz_dy).atan().to_degrees();
+        let aspect = (-dz_dx).atan2(-dz_dy).to_degrees().rem_euclid(360.0);
+        Some((slope, aspect))
+    }
+
     /// Conservative (min, max) metres for culling: the tile itself, else its nearest loaded ancestor.
     pub fn min_max(&self, id: TileId) -> (f32, f32) {
         let mut cur = Some(id);
@@ -124,6 +142,51 @@ mod tests {
         let b = 32768.0 - 430.0; // 32338 = 0x7E52
         let t = decode_terrarium(&[(b as u32 >> 8) as u8, (b as u32 & 255) as u8, 0, 255]);
         assert!((t.heights[0] + 430.0).abs() < 1e-3);
+    }
+
+    /// A plane tilted by `deg` that rises toward `east_per_px` / `north_per_px` of a z10 tile.
+    fn plane(deg: f64, rises_east: bool, rises_north: bool) -> (HeightField, LngLat) {
+        let p = LngLat::new(-92.17, 38.58);
+        let id = TileId::from_lnglat(p, 10);
+        let px_m = smf_geo::meters_per_pixel(p.lat, 10.0) * 256.0 / 255.0;
+        let per_px = deg.to_radians().tan() * px_m;
+        let mut t = flat_tile(0.0);
+        for y in 0..TILE_PX {
+            for x in 0..TILE_PX {
+                let mut h = 3000.0;
+                if rises_east {
+                    h += x as f64 * per_px;
+                }
+                if rises_north {
+                    h += (TILE_PX - 1 - y) as f64 * per_px;
+                }
+                t.heights[y * TILE_PX + x] = h as f32;
+            }
+        }
+        let mut hf = HeightField::default();
+        hf.insert(id, t);
+        (hf, p)
+    }
+
+    #[test]
+    fn slope_and_aspect_of_known_planes() {
+        // Rising to the east means the slope faces west (270); rising north faces south (180).
+        let (hf, p) = plane(25.0, true, false);
+        let (s, a) = hf.slope_aspect(p).unwrap();
+        assert!((s - 25.0).abs() < 0.6, "{s}");
+        assert!((a - 270.0).abs() < 1.0, "{a}");
+        let (hf, p) = plane(35.0, false, true);
+        let (s, a) = hf.slope_aspect(p).unwrap();
+        assert!((s - 35.0).abs() < 0.8, "{s}");
+        assert!((a - 180.0).abs() < 1.0, "{a}");
+        // Rising both ways faces south-west.
+        let (hf, p) = plane(20.0, true, true);
+        let (_, a) = hf.slope_aspect(p).unwrap();
+        assert!((a - 225.0).abs() < 2.0, "{a}");
+        // Flat ground has zero slope, and unloaded terrain gives None rather than a guess.
+        let (hf, p) = plane(0.0, true, false);
+        assert!(hf.slope_aspect(p).unwrap().0 < 0.1);
+        assert!(HeightField::default().slope_aspect(p).is_none());
     }
 
     #[test]

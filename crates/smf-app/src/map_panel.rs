@@ -109,6 +109,8 @@ pub struct MapPanel {
     /// Set by the host to fit a bounding box on the next frame once the viewport size is known.
     pub pending_fit: Option<[f64; 4]>,
     cursor_elev: Option<f32>,
+    /// Slope degrees and the compass bearing it faces, under the pointer.
+    cursor_slope: Option<(f64, f64)>,
     /// Draw-call stats shown in the status bar (3D).
     last_chunks: usize,
     pub(crate) overlays: Vec<OverlayLayer>,
@@ -185,6 +187,7 @@ impl MapPanel {
             drag: None,
             pending_fit: None,
             cursor_elev: None,
+            cursor_slope: None,
             last_chunks: 0,
             overlays: vec![],
             hidden: Default::default(),
@@ -372,6 +375,10 @@ impl MapPanel {
                     ui.separator();
                     ui.label(format!("Elev {e:.0} m ({:.0} ft)", e * 3.280_84));
                 }
+                if let Some((deg, aspect)) = self.cursor_slope {
+                    ui.separator();
+                    ui.label(format!("Slope {deg:.0}° facing {}", compass(aspect)));
+                }
                 if self.mode == ViewMode::Terrain {
                     ui.separator();
                     ui.weak(format!(
@@ -488,6 +495,7 @@ impl MapPanel {
             .and_then(|p| proj.unproject(to_px(p, rect, ppp)));
         overlay::draw_drafts(&painter, &pj, editor, cursor_ll);
         self.cursor_elev = cursor_ll.and_then(|ll| self.heights.sample(ll));
+        self.cursor_slope = cursor_ll.and_then(|ll| self.heights.slope_aspect(ll));
         if self.mode == ViewMode::Flat
             && let Some(ll) = cursor_ll
         {
@@ -1012,6 +1020,12 @@ impl MapPanel {
     }
 }
 
+/// 8-point compass name for a bearing in degrees.
+fn compass(bearing: f64) -> &'static str {
+    const NAMES: [&str; 8] = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"];
+    NAMES[((bearing.rem_euclid(360.0) + 22.5) / 45.0) as usize % 8]
+}
+
 fn to_px(p: Pos2, rect: Rect, ppp: f32) -> [f64; 2] {
     [
         ((p.x - rect.min.x) * ppp) as f64,
@@ -1062,7 +1076,17 @@ fn nice_scale(meters: f64) -> (f64, String) {
 
 #[cfg(test)]
 mod tests {
-    use super::nice_scale;
+    use super::{compass, nice_scale};
+
+    #[test]
+    fn compass_names() {
+        assert_eq!(compass(0.0), "N");
+        assert_eq!(compass(359.0), "N");
+        assert_eq!(compass(44.0), "NE");
+        assert_eq!(compass(225.0), "SW");
+        assert_eq!(compass(270.0), "W");
+        assert_eq!(compass(-90.0), "W");
+    }
 
     #[test]
     fn scale_picks_round_numbers() {
