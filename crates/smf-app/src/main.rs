@@ -1,5 +1,6 @@
 //! ShowMeFire Field desktop entry point.
 
+mod earth_ui;
 mod ext_ui;
 mod layers;
 mod layers_ui;
@@ -109,7 +110,7 @@ impl FieldApp {
     }
 
     /// Verification hooks. SMF_CAM="lng,lat,distance_m,pitch_deg,heading_deg" starts in 3D at that
-    /// camera; SMF_SLOPE=deg|fire turns on slope shading; SMF_SELECT=<feature name> selects it; SMF_IMPORT=a;b imports files at startup; SMF_VIEW=lng,lat,zoom; SMF_DOWNLOAD=lng,lat,span,zmin,zmax,name; SMF_OFFLINE=1; SMF_BASEMAP=id; SMF_INFO=<layer id>; SMF_COND=lng,lat; SMF_EXT=history,snow; SMF_TRAIL_ROUTE=lng,lat;lng,lat;... (+SMF_TRAILS_FILE=overpass.json); SMF_W3W_SEARCH=a.b.c; SMF_W3W_GRID=1; SMF_W3W_HOVER=lng,lat (all need W3W_API_KEY; SMF_W3W_BASE=<url> points at a mock); SMF_FORECAST=<lead hours>; SMF_API_BASE=<url>; SMF_LAYER=file[@opacity]; SMF_PRINT=out.pdf[,scale,dpi] (+SMF_PRINT_DELAY secs); SMF_GEOTIFF=out.tif[,zoom,half_span_deg].
+    /// camera; SMF_SLOPE=deg|fire turns on slope shading; SMF_SELECT=<feature name> selects it; SMF_IMPORT=a;b imports files at startup; SMF_VIEW=lng,lat,zoom; SMF_DOWNLOAD=lng,lat,span,zmin,zmax,name; SMF_OFFLINE=1; SMF_BASEMAP=id; SMF_INFO=<layer id>; SMF_COND=lng,lat; SMF_EARTH=out.kmz[,max_zoom,levels]; SMF_EXT=history,snow; SMF_TRAIL_ROUTE=lng,lat;lng,lat;... (+SMF_TRAILS_FILE=overpass.json); SMF_W3W_SEARCH=a.b.c; SMF_W3W_GRID=1; SMF_W3W_HOVER=lng,lat (all need W3W_API_KEY; SMF_W3W_BASE=<url> points at a mock); SMF_FORECAST=<lead hours>; SMF_API_BASE=<url>; SMF_LAYER=file[@opacity]; SMF_PRINT=out.pdf[,scale,dpi] (+SMF_PRINT_DELAY secs); SMF_GEOTIFF=out.tif[,zoom,half_span_deg].
     fn apply_dev_env(&mut self) {
         if let Ok(v) = std::env::var("SMF_CAM") {
             let n: Vec<f64> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
@@ -224,6 +225,17 @@ impl FieldApp {
                 .collect();
             self.map.trails.on = true;
             self.map.trails.dev_route = Some(pts);
+        }
+        if let Ok(v) = std::env::var("SMF_EARTH") {
+            // out.kmz[,max_zoom,levels]: export the view as a SuperOverlay at startup
+            let p: Vec<&str> = v.split(',').collect();
+            self.map.earth.dev_out = Some(PathBuf::from(p[0]));
+            if let Some(z) = p.get(1).and_then(|x| x.trim().parse().ok()) {
+                self.map.earth.max_zoom = z;
+            }
+            if let Some(l) = p.get(2).and_then(|x| x.trim().parse().ok()) {
+                self.map.earth.levels = l;
+            }
         }
         if let Ok(v) = std::env::var("SMF_EXT") {
             // history,snow: switch those layers on at startup
@@ -478,6 +490,10 @@ impl FieldApp {
                     }
                     if ui.button("Export GeoTIFF…").clicked() {
                         self.map.open_print(print_ui::PrintKind::GeoTiff);
+                        ui.close();
+                    }
+                    if ui.button("Export Google Earth SuperOverlay…").clicked() {
+                        self.map.open_earth();
                         ui.close();
                     }
                     ui.menu_button("Export", |ui| {

@@ -2,6 +2,7 @@
 //! and overlays. The renderer draws offscreen; the texture is shown as an egui
 //! image with egui-painted features and chrome on top.
 
+use crate::earth_ui::EarthUi;
 use crate::ext_ui::ExtState;
 use crate::layers::LayerStore;
 use crate::layers_ui::{ActiveDownload, DownloadUi, OverlayLayer};
@@ -132,6 +133,7 @@ pub struct MapPanel {
     pub(crate) smf: SmfState,
     pub(crate) w3w: W3wState,
     pub(crate) ext: ExtState,
+    pub(crate) earth: EarthUi,
     pub(crate) trails: TrailState,
     /// SMF_COND verification hook: query conditions here on the first frame.
     pub dev_conditions: Option<LngLat>,
@@ -209,6 +211,7 @@ impl MapPanel {
             smf: SmfState::new(&cc.egui_ctx),
             w3w: W3wState::new(),
             ext: ExtState::new(),
+            earth: EarthUi::default(),
             trails: TrailState::new(),
             dev_conditions: None,
             cache_dir,
@@ -430,6 +433,7 @@ impl MapPanel {
         self.print_window(ui.ctx(), editor);
         self.smf_windows(ui.ctx(), editor);
         self.w3w_window(ui.ctx());
+        self.earth_window(ui.ctx());
     }
 
     fn shading_menu(&mut self, ui: &mut egui::Ui) {
