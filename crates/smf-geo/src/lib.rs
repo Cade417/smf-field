@@ -142,6 +142,20 @@ pub fn format_area(m2: f64) -> String {
     }
 }
 
+/// Web Mercator (EPSG:3857) metres: x east, y north, origin at (0, 0) degrees.
+pub fn lnglat_to_mercator(p: LngLat) -> (f64, f64) {
+    let lat = p.lat.clamp(-MAX_LAT, MAX_LAT).to_radians();
+    let x = p.lng / 360.0 * EARTH_CIRCUMFERENCE_M;
+    let y = (PI / 4.0 + lat / 2.0).tan().ln() / (2.0 * PI) * EARTH_CIRCUMFERENCE_M;
+    (x, y)
+}
+
+pub fn mercator_to_lnglat(x: f64, y: f64) -> LngLat {
+    let lng = x / EARTH_CIRCUMFERENCE_M * 360.0;
+    let lat = (2.0 * (y / EARTH_CIRCUMFERENCE_M * 2.0 * PI).exp().atan() - PI / 2.0).to_degrees();
+    LngLat { lng, lat }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -179,6 +193,18 @@ mod tests {
     #[test]
     fn meters_per_pixel_z0_equator() {
         assert!((meters_per_pixel(0.0, 0.0) - 156_543.03).abs() < 0.01);
+    }
+
+    #[test]
+    fn mercator_roundtrip_and_known_values() {
+        let (x, y) = lnglat_to_mercator(LngLat::new(180.0, 0.0));
+        assert!((x - EARTH_CIRCUMFERENCE_M / 2.0).abs() < 1e-6 && y.abs() < 1e-6);
+        let (_, y) = lnglat_to_mercator(LngLat::new(0.0, MAX_LAT));
+        assert!((y - EARTH_CIRCUMFERENCE_M / 2.0).abs() < 1.0);
+        let p = LngLat::new(-92.3, 38.6);
+        let (x, y) = lnglat_to_mercator(p);
+        let q = mercator_to_lnglat(x, y);
+        assert!((p.lng - q.lng).abs() < 1e-9 && (p.lat - q.lat).abs() < 1e-9);
     }
 
     #[test]

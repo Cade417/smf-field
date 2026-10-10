@@ -10,6 +10,7 @@ workspace = true
 
 [dependencies]
 smf-geo.workspace = true
+smf-terrain.workspace = true
 # Must resolve to the same wgpu version eframe uses (see workspace Cargo.toml note).
 wgpu = "30"
 bytemuck = { version = "1", features = ["derive"] }

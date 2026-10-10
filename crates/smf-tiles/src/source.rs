@@ -1,8 +1,20 @@
 use serde::Deserialize;
 use smf_geo::TileId;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SourceKind {
+    /// Display imagery (basemaps and overlays).
+    #[default]
+    Raster,
+    /// Terrarium-encoded elevation tiles.
+    Terrarium,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct TileSource {
+    #[serde(default)]
+    pub kind: SourceKind,
     pub id: String,
     pub name: String,
     /// Template with {z} {x} {y} {-y} (TMS row) and {s} (subdomain).
@@ -44,9 +56,37 @@ pub fn default_sources() -> Vec<TileSource> {
     c.source
 }
 
+/// Display basemaps only (elevation sources are excluded).
+pub fn basemaps() -> Vec<TileSource> {
+    default_sources()
+        .into_iter()
+        .filter(|s| s.kind == SourceKind::Raster)
+        .collect()
+}
+
+/// The elevation source used for 3D terrain, hillshade, slope and profiles.
+pub fn terrain_source() -> TileSource {
+    default_sources()
+        .into_iter()
+        .find(|s| s.kind == SourceKind::Terrarium)
+        .expect("assets/sources.toml must define a terrarium source")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terrain_source_is_separate_from_basemaps() {
+        assert!(basemaps().iter().all(|s| s.kind == SourceKind::Raster));
+        let t = terrain_source();
+        assert_eq!(t.max_zoom, 15);
+        assert!(t.offline_allowed);
+        assert!(
+            t.tile_url(TileId::new(3, 1, 2))
+                .ends_with("/terrarium/3/1/2.png")
+        );
+    }
 
     #[test]
     fn catalog_parses_and_flags_restricted() {

@@ -49,3 +49,15 @@ url = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
 max_zoom = 19
 attribution = "OpenStreetMap contributors"
 offline_allowed = false
+
+# Elevation (not a basemap): Mapzen/AWS open terrain tiles, Terrarium-encoded, a composite of
+# SRTM, USGS 3DEP and other datasets that each require attribution (shown on screen).
+# Powers 3D, hillshade, slope shading, profiles and elevation readouts.
+[[source]]
+id = "terrarium"
+kind = "terrarium"
+name = "Terrain (Terrarium)"
+url = "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png"
+max_zoom = 15
+attribution = "Terrain: Mapzen, USGS 3DEP/SRTM and others"
+offline_allowed = true

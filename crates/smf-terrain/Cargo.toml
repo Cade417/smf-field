@@ -9,3 +9,5 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+smf-geo.workspace = true
+glam = "0.30"

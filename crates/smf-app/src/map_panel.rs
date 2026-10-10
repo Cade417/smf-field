@@ -1,15 +1,16 @@
-//! The interactive 2D map: input handling, tile pipeline glue, tools, and overlays.
-//! The renderer draws offscreen; the texture is shown as an egui image with
-//! egui-painted features and chrome on top.
+//! The interactive map: 2D and 3D views, input handling, tile pipeline glue, tools,
+//! and overlays. The renderer draws offscreen; the texture is shown as an egui
+//! image with egui-painted features and chrome on top.
 
 use crate::{overlay, panels};
 use directories::ProjectDirs;
 use eframe::egui::{self, Align2, Color32, Key, PointerButton, Pos2, Rect, Sense, Stroke, Vec2};
 use eframe::egui_wgpu;
 use smf_features::{Editor, Geometry, Hit, Tool, pick, snap};
-use smf_geo::{LngLat, MapView, meters_per_pixel};
-use smf_render::{MapRenderer, TileKey, plan_frame};
-use smf_tiles::{TileEvent, TileService, TileSource, default_sources};
+use smf_geo::{LngLat, MapView, TileId, meters_per_pixel};
+use smf_render::{MapRenderer, ShadeParams, TileKey, plan_frame};
+use smf_terrain::{Camera3D, HeightField, decode_terrarium, select_chunks};
+use smf_tiles::{TileEvent, TileService, TileSource, basemaps, terrain_source};
 use std::{
     collections::HashMap,
     sync::Arc,
@@ -24,12 +25,23 @@ const MAX_REQUESTS_PER_FRAME: usize = 160;
 /// Pointer tolerance for picking/snapping, in egui points.
 const PICK_TOL: f64 = 7.0;
 const FREEHAND_STEP: f32 = 4.0;
+/// Keeps terrain failures separate from basemap failures in the retry-backoff map.
+const TERRAIN_FAIL_SOURCE: u16 = u16::MAX;
+/// Mesh cells larger than this many pixels get subdivided.
+const SPLIT_PX: f64 = 10.0;
+const MAX_CHUNKS: usize = 350;
 
 #[derive(Clone, Copy, PartialEq)]
 enum CoordFormat {
     Dd,
     Dms,
     Utm,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ViewMode {
+    Flat,
+    Terrain,
 }
 
 /// What a left-drag is currently doing, decided when the drag starts.
@@ -40,14 +52,49 @@ enum DragMode {
     Freehand,
 }
 
+/// Mode-aware conversion between screen pixels and geography for picking and tools.
+struct Proj<'a> {
+    mode: ViewMode,
+    view: MapView,
+    cam: Camera3D,
+    hf: &'a HeightField,
+}
+
+impl Proj<'_> {
+    fn project(&self, ll: LngLat) -> [f64; 2] {
+        match self.mode {
+            ViewMode::Flat => self.view.lnglat_to_screen(ll),
+            ViewMode::Terrain => {
+                let e = self.hf.sample(ll).unwrap_or(0.0) as f64;
+                // Far off-screen so behind-camera points never match a pick.
+                self.cam.project(ll, e).unwrap_or([-1e9, -1e9])
+            }
+        }
+    }
+
+    /// Geographic point under a pixel; in 3D this is where the ray meets loaded terrain.
+    fn unproject(&self, px: [f64; 2]) -> Option<LngLat> {
+        match self.mode {
+            ViewMode::Flat => Some(self.view.screen_to_lnglat(px)),
+            ViewMode::Terrain => self.cam.pick_ground(px, self.hf).map(|(l, _)| l),
+        }
+    }
+}
+
 pub struct MapPanel {
     sources: Vec<Arc<TileSource>>,
     selected: usize,
+    terrain_src: Arc<TileSource>,
     pub view: MapView,
+    pub cam: Camera3D,
+    pub mode: ViewMode,
+    pub shade2d: ShadeParams,
+    pub shade3d: ShadeParams,
     renderer: MapRenderer,
     tiles: TileService,
     texture: Option<egui::TextureId>,
     failed: HashMap<TileKey, Instant>,
+    heights: HeightField,
     velocity: Vec2,
     last_frame: Instant,
     coord_format: CoordFormat,
@@ -55,6 +102,9 @@ pub struct MapPanel {
     drag: Option<DragMode>,
     /// Set by the host to fit a bounding box on the next frame once the viewport size is known.
     pub pending_fit: Option<[f64; 4]>,
+    cursor_elev: Option<f32>,
+    /// Draw-call stats shown in the status bar (3D).
+    last_chunks: usize,
 }
 
 impl MapPanel {
@@ -69,21 +119,38 @@ impl MapPanel {
         tracing::info!("tile cache: {}", cache_dir.display());
         let ctx = cc.egui_ctx.clone();
         let tiles = TileService::new(cache_dir, move || ctx.request_repaint());
+        let center = LngLat::new(-92.5, 38.5);
         Self {
-            sources: default_sources().into_iter().map(Arc::new).collect(),
+            sources: basemaps().into_iter().map(Arc::new).collect(),
             selected: 0,
+            terrain_src: Arc::new(terrain_source()),
             // Missouri: the home turf for Show Me Fire data.
-            view: MapView::new(LngLat::new(-92.5, 38.5), 7.0, [1.0, 1.0]),
+            view: MapView::new(center, 7.0, [1.0, 1.0]),
+            cam: Camera3D {
+                target: center,
+                ..Camera3D::default()
+            },
+            mode: ViewMode::Flat,
+            shade2d: ShadeParams::default(),
+            // Without lighting, 3D terrain reads as a flat picture, so shade by default.
+            shade3d: ShadeParams {
+                hillshade: true,
+                hill_strength: 0.75,
+                ..ShadeParams::default()
+            },
             renderer: MapRenderer::new(&rs.device, &rs.queue),
             tiles,
             texture: None,
             failed: HashMap::new(),
+            heights: HeightField::default(),
             velocity: Vec2::ZERO,
             last_frame: Instant::now(),
             coord_format: CoordFormat::Dd,
             render_state: rs,
             drag: None,
             pending_fit: None,
+            cursor_elev: None,
+            last_chunks: 0,
         }
     }
 
@@ -97,6 +164,31 @@ impl MapPanel {
         }
     }
 
+    /// Switch 2D <-> 3D keeping the same place and (roughly) the same scale and direction.
+    pub fn set_mode(&mut self, mode: ViewMode) {
+        if mode == self.mode {
+            return;
+        }
+        self.velocity = Vec2::ZERO;
+        match mode {
+            ViewMode::Terrain => {
+                self.cam.viewport = self.view.size;
+                self.cam.target = self.view.center;
+                self.cam.target_elev_m =
+                    self.heights.sample(self.view.center).unwrap_or(0.0) as f64;
+                self.cam.distance_m = self.cam.distance_for_zoom(self.view.zoom);
+                self.cam.heading = (-self.view.angle).rem_euclid(std::f64::consts::TAU);
+                self.cam.pitch = 55f64.to_radians();
+            }
+            ViewMode::Flat => {
+                self.view.center = self.cam.target;
+                self.view.zoom = self.cam.zoom_for_distance().clamp(0.0, MAX_ZOOM);
+                self.view.angle = -self.cam.heading;
+            }
+        }
+        self.mode = mode;
+    }
+
     /// Fit a (min_lng, min_lat, max_lng, max_lat) box into the viewport with a margin.
     pub fn fit_bounds(&mut self, b: [f64; 4]) {
         let center = LngLat::new((b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0);
@@ -107,6 +199,17 @@ impl MapPanel {
         let z = (avail[0] / w).min(avail[1] / h).log2();
         self.view.center = center;
         self.view.zoom = z.clamp(0.0, 17.0);
+        // Same framing for the 3D camera.
+        self.cam.target = center;
+        self.cam.target_elev_m = self.heights.sample(center).unwrap_or(0.0) as f64;
+        self.cam.distance_m = self.cam.distance_for_zoom(self.view.zoom) * 1.1;
+    }
+
+    fn active_shade(&mut self) -> &mut ShadeParams {
+        match self.mode {
+            ViewMode::Flat => &mut self.shade2d,
+            ViewMode::Terrain => &mut self.shade3d,
+        }
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui, editor: &mut Editor) {
@@ -121,6 +224,12 @@ impl MapPanel {
                         }
                     });
                 ui.separator();
+                let mut want = self.mode;
+                ui.selectable_value(&mut want, ViewMode::Flat, "2D");
+                ui.selectable_value(&mut want, ViewMode::Terrain, "3D");
+                self.set_mode(want);
+                ui.menu_button("Shading", |ui| self.shading_menu(ui));
+                ui.separator();
                 ui.label("Coords");
                 ui.selectable_value(&mut self.coord_format, CoordFormat::Dd, "DD");
                 ui.selectable_value(&mut self.coord_format, CoordFormat::Dms, "DMS");
@@ -128,18 +237,24 @@ impl MapPanel {
                 ui.separator();
                 if ui.button("North up").clicked() {
                     self.view.angle = 0.0;
+                    self.cam.heading = 0.0;
                 }
             });
         });
 
-        let mut zoom_to = None;
+        let mut action = panels::PanelAction {
+            zoom_to: None,
+            profile_tiles: vec![],
+        };
         egui::Panel::right("side")
             .default_size(290.0)
             .show(ui, |ui| {
-                let a = panels::side_panel(ui, editor);
-                zoom_to = a.zoom_to;
+                action = panels::side_panel(ui, editor, &self.heights);
             });
-        if let Some(id) = zoom_to
+        for id in std::mem::take(&mut action.profile_tiles) {
+            self.request_terrain_tile(id, -5.0);
+        }
+        if let Some(id) = action.zoom_to
             && let Some(f) = editor.project.feature(id)
         {
             let v = f.geometry.vertices();
@@ -166,9 +281,57 @@ impl MapPanel {
                     ui.separator();
                     ui.label(egui::RichText::new(m).strong());
                 }
+                if let Some(e) = self.cursor_elev {
+                    ui.separator();
+                    ui.label(format!("Elev {e:.0} m ({:.0} ft)", e * 3.280_84));
+                }
+                if self.mode == ViewMode::Terrain {
+                    ui.separator();
+                    ui.weak(format!(
+                        "3D: {} chunks | pitch {:.0}° | heading {:.0}° | {} m out",
+                        self.last_chunks,
+                        self.cam.pitch.to_degrees(),
+                        self.cam.heading.to_degrees(),
+                        self.cam.distance_m as i64
+                    ));
+                }
             });
         });
         egui::CentralPanel::default().show(ui, |ui| self.map_area(ui, editor));
+    }
+
+    fn shading_menu(&mut self, ui: &mut egui::Ui) {
+        let mode = self.mode;
+        let p = self.active_shade();
+        ui.checkbox(&mut p.hillshade, "Hillshade");
+        ui.add_enabled(
+            p.hillshade,
+            egui::Slider::new(&mut p.hill_strength, 0.1..=1.0).text("strength"),
+        );
+        ui.checkbox(&mut p.slope, "Slope angle shading");
+        ui.add_enabled(
+            p.slope,
+            egui::Slider::new(&mut p.slope_alpha, 0.1..=1.0).text("opacity"),
+        );
+        ui.add_enabled_ui(p.slope, |ui| {
+            ui.radio_value(
+                &mut p.slope_fire_preset,
+                false,
+                "Degrees: 27 / 30 / 35 / 40",
+            );
+            ui.radio_value(
+                &mut p.slope_fire_preset,
+                true,
+                "Fire grade: 20 / 40 / 60 / 80 %",
+            );
+        });
+        ui.separator();
+        ui.add(egui::Slider::new(&mut p.sun_azimuth_deg, 0.0..=360.0).text("sun azimuth"));
+        ui.add(egui::Slider::new(&mut p.sun_altitude_deg, 5.0..=80.0).text("sun altitude"));
+        if mode == ViewMode::Terrain {
+            ui.add(egui::Slider::new(&mut p.exaggeration, 1.0..=4.0).text("vertical exaggeration"));
+        }
+        ui.weak("Terrain: Mapzen / USGS 3DEP / SRTM");
     }
 
     fn map_area(&mut self, ui: &mut egui::Ui, editor: &mut Editor) {
@@ -177,6 +340,7 @@ impl MapPanel {
         let dt = self.last_frame.elapsed().as_secs_f32().min(0.1);
         self.last_frame = Instant::now();
         self.view.size = [(rect.width() * ppp) as f64, (rect.height() * ppp) as f64];
+        self.cam.viewport = self.view.size;
         if let Some(b) = self.pending_fit.take() {
             self.fit_bounds(b);
         }
@@ -187,11 +351,81 @@ impl MapPanel {
         // Tile pipeline: bump generation, ingest finished tiles, plan, request, render.
         self.tiles.begin_frame();
         self.renderer.begin_frame();
+        self.ingest_tiles(ui.ctx());
+
+        let src = self.sources[self.selected].clone();
+        let size = [
+            self.view.size[0].max(1.0) as u32,
+            self.view.size[1].max(1.0) as u32,
+        ];
+        if self.renderer.ensure_target(size) {
+            self.register_texture();
+        }
+        match self.mode {
+            ViewMode::Flat => self.render_flat(&src),
+            ViewMode::Terrain => self.render_terrain(&src),
+        }
+        if let Some(id) = self.texture {
+            ui.painter().image(
+                id,
+                rect,
+                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                Color32::WHITE,
+            );
+        }
+
+        let painter = ui.painter_at(rect);
+        let pj = match self.mode {
+            ViewMode::Flat => overlay::Projector::Flat {
+                view: &self.view,
+                origin: rect.min,
+                ppp,
+            },
+            ViewMode::Terrain => overlay::Projector::Terrain {
+                cam: &self.cam,
+                hf: &self.heights,
+                origin: rect.min,
+                ppp,
+            },
+        };
+        overlay::draw_project(&painter, &pj, editor);
+        let proj = self.proj();
+        let cursor_ll = resp
+            .hover_pos()
+            .and_then(|p| proj.unproject(to_px(p, rect, ppp)));
+        overlay::draw_drafts(&painter, &pj, editor, cursor_ll);
+        self.cursor_elev = cursor_ll.and_then(|ll| self.heights.sample(ll));
+        if self.mode == ViewMode::Flat
+            && let Some(ll) = cursor_ll
+        {
+            // Hovering is enough to fetch the elevation tile for the readout.
+            let z = (self.view.zoom.round() as u8).clamp(6, 13);
+            self.request_terrain_tile(TileId::from_lnglat(ll, z), -1.0);
+        }
+        self.draw_chrome(ui, cursor_ll, rect, ppp, &src);
+    }
+
+    fn proj(&self) -> Proj<'_> {
+        Proj {
+            mode: self.mode,
+            view: self.view,
+            cam: self.cam,
+            hf: &self.heights,
+        }
+    }
+
+    /// Drain finished tiles into the GPU pools, within a per-frame budget.
+    fn ingest_tiles(&mut self, ctx: &egui::Context) {
         let mut uploads = 0;
         while uploads < MAX_UPLOADS_PER_FRAME {
             match self.tiles.try_recv() {
                 Some(TileEvent::Ready { source, id, rgba }) => {
-                    if let Some(si) = self.sources.iter().position(|s| s.id == source) {
+                    if source == self.terrain_src.id {
+                        let t = decode_terrarium(&rgba);
+                        self.renderer.upload_height(id, &t.heights);
+                        self.heights.insert(id, t);
+                        uploads += 1;
+                    } else if let Some(si) = self.sources.iter().position(|s| s.id == source) {
                         self.renderer.upload_tile(
                             TileKey {
                                 source: si as u16,
@@ -203,30 +437,53 @@ impl MapPanel {
                     }
                 }
                 Some(TileEvent::Failed { source, id }) => {
-                    if let Some(si) = self.sources.iter().position(|s| s.id == source) {
-                        self.failed.insert(
-                            TileKey {
-                                source: si as u16,
-                                id,
-                            },
-                            Instant::now(),
-                        );
+                    let si = if source == self.terrain_src.id {
+                        Some(TERRAIN_FAIL_SOURCE)
+                    } else {
+                        self.sources
+                            .iter()
+                            .position(|s| s.id == source)
+                            .map(|i| i as u16)
+                    };
+                    if let Some(si) = si {
+                        self.failed
+                            .insert(TileKey { source: si, id }, Instant::now());
                     }
                 }
                 None => break,
             }
         }
         if uploads == MAX_UPLOADS_PER_FRAME {
-            ui.ctx().request_repaint(); // more tiles waiting in the channel
+            ctx.request_repaint(); // more tiles waiting in the channel
         }
-        let src = self.sources[self.selected].clone();
-        let plan = plan_frame(
-            &mut self.renderer,
-            &self.view,
-            self.selected as u16,
-            src.max_zoom,
-        );
-        for (key, prio) in plan.requests.iter().take(MAX_REQUESTS_PER_FRAME) {
+    }
+
+    /// Request an elevation tile (or re-upload it from the CPU copy if the GPU evicted it).
+    fn request_terrain_tile(&mut self, id: TileId, prio: f32) {
+        if let Some(t) = self.heights.get(id) {
+            if !self.renderer.has_height(id) {
+                let t = t.clone();
+                self.renderer.upload_height(id, &t.heights);
+            }
+            return;
+        }
+        let key = TileKey {
+            source: TERRAIN_FAIL_SOURCE,
+            id,
+        };
+        if self
+            .failed
+            .get(&key)
+            .is_some_and(|t| t.elapsed() < RETRY_AFTER)
+        {
+            return;
+        }
+        let src = self.terrain_src.clone();
+        self.tiles.request(&src, id, prio);
+    }
+
+    fn request_imagery(&mut self, src: &Arc<TileSource>, reqs: &[(TileKey, f32)]) {
+        for (key, prio) in reqs.iter().take(MAX_REQUESTS_PER_FRAME) {
             if self
                 .failed
                 .get(key)
@@ -234,45 +491,47 @@ impl MapPanel {
             {
                 continue;
             }
-            self.tiles.request(&src, key.id, *prio);
+            self.tiles.request(src, key.id, *prio);
         }
-
-        let size = [
-            self.view.size[0].max(1.0) as u32,
-            self.view.size[1].max(1.0) as u32,
-        ];
-        if self.renderer.ensure_target(size) {
-            self.register_texture();
-        }
-        self.renderer.render(&plan.quads);
-        if let Some(id) = self.texture {
-            ui.painter().image(
-                id,
-                rect,
-                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                Color32::WHITE,
-            );
-        }
-
-        let painter = ui.painter_at(rect);
-        let pj = overlay::Projector {
-            view: &self.view,
-            origin: rect.min,
-            ppp,
-        };
-        overlay::draw_project(&painter, &pj, editor);
-        let cursor_ll = resp
-            .hover_pos()
-            .map(|p| self.screen_to_lnglat(p, rect, ppp));
-        overlay::draw_drafts(&painter, &pj, editor, cursor_ll);
-        self.draw_chrome(ui, &resp, rect, ppp, &src);
     }
 
-    fn screen_to_lnglat(&self, p: Pos2, rect: Rect, ppp: f32) -> LngLat {
-        self.view.screen_to_lnglat([
-            ((p.x - rect.min.x) * ppp) as f64,
-            ((p.y - rect.min.y) * ppp) as f64,
-        ])
+    fn render_flat(&mut self, src: &Arc<TileSource>) {
+        let plan = plan_frame(
+            &mut self.renderer,
+            &self.view,
+            self.selected as u16,
+            src.max_zoom,
+        );
+        self.request_imagery(src, &plan.requests);
+        let params = self.shade2d;
+        let verts = if params.hillshade || params.slope {
+            let (v, reqs) = self.renderer.plan_shade(&self.view, plan.tile_zoom);
+            for (k, p) in reqs.iter().take(80) {
+                self.request_terrain_tile(k.id, *p);
+            }
+            v
+        } else {
+            vec![]
+        };
+        self.renderer.render_2d(&plan.quads, &verts, &params);
+    }
+
+    fn render_terrain(&mut self, src: &Arc<TileSource>) {
+        // Follow the loaded ground under the target, then keep the eye out of the hillside.
+        if let Some(h) = self.heights.sample(self.cam.target) {
+            self.cam.target_elev_m += (h as f64 - self.cam.target_elev_m) * 0.25;
+        }
+        self.cam.enforce_clearance(&self.heights);
+        let chunks = select_chunks(&self.cam, &self.heights, src.max_zoom, SPLIT_PX, MAX_CHUNKS);
+        self.last_chunks = chunks.len();
+        let params = self.shade3d;
+        let plan = self
+            .renderer
+            .render_3d(&self.cam, &chunks, self.selected as u16, &params);
+        self.request_imagery(src, &plan.imagery_requests);
+        for (k, p) in plan.height_requests.iter().take(80) {
+            self.request_terrain_tile(k.id, *p);
+        }
     }
 
     /// (Re)register the offscreen target with egui; called whenever it is recreated on resize.
@@ -355,29 +614,34 @@ impl MapPanel {
         dt: f32,
         editor: &mut Editor,
     ) {
-        let to_px = |p: Pos2| {
-            [
-                ((p.x - rect.min.x) * ppp) as f64,
-                ((p.y - rect.min.y) * ppp) as f64,
-            ]
+        let hf = &self.heights;
+        let proj = Proj {
+            mode: self.mode,
+            view: self.view,
+            cam: self.cam,
+            hf,
         };
-        let view = self.view;
-        let proj = move |p: LngLat| view.lnglat_to_screen(p);
+        let project = |p: LngLat| proj.project(p);
         let tol = PICK_TOL * ppp as f64;
         let shift = ui.input(|i| i.modifiers.shift);
+        let terrain = self.mode == ViewMode::Terrain;
 
         // Decide what a left-drag does the moment it starts.
         if resp.drag_started_by(PointerButton::Primary) {
             self.velocity = Vec2::ZERO;
-            let start = ui.input(|i| i.pointer.press_origin()).map(to_px);
+            let start = ui
+                .input(|i| i.pointer.press_origin())
+                .map(|p| to_px(p, rect, ppp));
             self.drag = Some(DragMode::Pan);
             if let Some(pt) = start {
                 if editor.tool == Tool::Freehand {
-                    editor.draft.clear();
-                    editor.freehand_point(self.view.screen_to_lnglat(pt));
-                    self.drag = Some(DragMode::Freehand);
+                    if let Some(ll) = proj.unproject(pt) {
+                        editor.draft.clear();
+                        editor.freehand_point(ll);
+                        self.drag = Some(DragMode::Freehand);
+                    }
                 } else if editor.tool == Tool::Select
-                    && let Some(hit) = pick(&editor.project, editor.selection, &proj, pt, tol)
+                    && let Some(hit) = pick(&editor.project, editor.selection, &project, pt, tol)
                     && let Some(f) = editor.project.feature(hit.id)
                 {
                     let movable_body = matches!(
@@ -396,9 +660,13 @@ impl MapPanel {
 
         match self.drag {
             Some(DragMode::Vertex { id, index }) if resp.dragged_by(PointerButton::Primary) => {
-                if let Some(p) = resp.interact_pointer_pos() {
-                    let mut ll = self.screen_to_lnglat(p, rect, ppp);
-                    if !shift && let Some(s) = snap_excluding(editor, id, &proj, to_px(p), tol) {
+                if let Some(p) = resp.interact_pointer_pos()
+                    && let Some(mut ll) = proj.unproject(to_px(p, rect, ppp))
+                {
+                    if !shift
+                        && let Some(s) =
+                            snap_excluding(editor, id, &project, to_px(p, rect, ppp), tol)
+                    {
                         ll = s;
                     }
                     editor.drag_vertex(id, index, ll);
@@ -406,21 +674,26 @@ impl MapPanel {
             }
             Some(DragMode::Freehand) if resp.dragged_by(PointerButton::Primary) => {
                 if let Some(p) = resp.interact_pointer_pos() {
-                    let last = editor.draft.last().map(|l| self.view.lnglat_to_screen(*l));
-                    let cur = to_px(p);
+                    let cur = to_px(p, rect, ppp);
+                    let last = editor.draft.last().map(|l| project(*l));
                     if last.is_none_or(|l| {
                         ((cur[0] - l[0]).hypot(cur[1] - l[1])) as f32 > FREEHAND_STEP * ppp
-                    }) {
-                        editor.freehand_point(self.view.screen_to_lnglat(cur));
+                    }) && let Some(ll) = proj.unproject(cur)
+                    {
+                        editor.freehand_point(ll);
                     }
                 }
             }
             Some(DragMode::Pan) if resp.dragged_by(PointerButton::Primary) => {
                 let d = resp.drag_delta();
-                self.view.pan_pixels((d.x * ppp) as f64, (d.y * ppp) as f64);
-                // Smoothed release velocity (points per second) for inertia.
-                if dt > 0.0 {
-                    self.velocity = self.velocity * 0.6 + (d / dt) * 0.4;
+                if terrain {
+                    self.cam.pan_pixels((d.x * ppp) as f64, (d.y * ppp) as f64);
+                } else {
+                    self.view.pan_pixels((d.x * ppp) as f64, (d.y * ppp) as f64);
+                    // Smoothed release velocity (points per second) for inertia.
+                    if dt > 0.0 {
+                        self.velocity = self.velocity * 0.6 + (d / dt) * 0.4;
+                    }
                 }
             }
             _ => {}
@@ -434,8 +707,13 @@ impl MapPanel {
         }
 
         if resp.dragged_by(PointerButton::Secondary) {
-            self.view.angle += resp.drag_delta().x as f64 * 0.006;
-        } else if !resp.dragged() && self.velocity.length() > 20.0 {
+            let d = resp.drag_delta();
+            if terrain {
+                self.cam.orbit(d.x as f64 * 0.005, d.y as f64 * 0.004);
+            } else {
+                self.view.angle += d.x as f64 * 0.006;
+            }
+        } else if !terrain && !resp.dragged() && self.velocity.length() > 20.0 {
             let v = self.velocity * dt;
             self.view.pan_pixels((v.x * ppp) as f64, (v.y * ppp) as f64);
             self.velocity *= 0.93f32.powf(dt * 60.0);
@@ -451,15 +729,14 @@ impl MapPanel {
         } else if resp.clicked_by(PointerButton::Primary)
             && let Some(p) = resp.interact_pointer_pos()
         {
-            let pt = to_px(p);
+            let pt = to_px(p, rect, ppp);
             if editor.tool == Tool::Select {
-                match pick(&editor.project, editor.selection, &proj, pt, tol) {
+                match pick(&editor.project, editor.selection, &project, pt, tol) {
                     Some(Hit { id, .. }) => editor.selection = Some(id),
                     None => editor.selection = None,
                 }
-            } else {
-                let mut ll = self.screen_to_lnglat(p, rect, ppp);
-                if !shift && let Some(s) = snap(&editor.project, &proj, pt, tol) {
+            } else if let Some(mut ll) = proj.unproject(pt) {
+                if !shift && let Some(s) = snap(&editor.project, &project, pt, tol) {
                     ll = s;
                 }
                 editor.click(ll);
@@ -468,8 +745,18 @@ impl MapPanel {
             && editor.tool == Tool::Select
             && let Some(p) = resp.interact_pointer_pos()
         {
-            self.view
-                .zoom_at(to_px(p), (self.view.zoom + 1.0).round(), MAX_ZOOM);
+            let pt = to_px(p, rect, ppp);
+            if terrain {
+                // Fly to the clicked ground point.
+                if let Some(ll) = proj.unproject(pt) {
+                    self.cam.target = ll;
+                    self.cam.target_elev_m = self.heights.sample(ll).unwrap_or(0.0) as f64;
+                    self.cam.dolly(0.5);
+                }
+            } else {
+                self.view
+                    .zoom_at(pt, (self.view.zoom + 1.0).round(), MAX_ZOOM);
+            }
         } else if resp.secondary_clicked()
             && let Some(p) = resp.interact_pointer_pos()
         {
@@ -477,8 +764,13 @@ impl MapPanel {
             if let Some(Hit {
                 id,
                 vertex: Some(i),
-            }) = pick(&editor.project, editor.selection, &proj, to_px(p), tol)
-            {
+            }) = pick(
+                &editor.project,
+                editor.selection,
+                &project,
+                to_px(p, rect, ppp),
+                tol,
+            ) {
                 editor.delete_vertex(id, i);
             }
         }
@@ -487,13 +779,17 @@ impl MapPanel {
             let (scroll, pinch) = ui
                 .ctx()
                 .input(|i| (i.smooth_scroll_delta.y, i.zoom_delta()));
-            let anchor = resp
-                .hover_pos()
-                .map(to_px)
-                .unwrap_or([self.view.size[0] / 2.0, self.view.size[1] / 2.0]);
             let dz = scroll as f64 * 0.004 + (pinch as f64).log2();
             if dz.abs() > 1e-6 {
-                self.view.zoom_at(anchor, self.view.zoom + dz, MAX_ZOOM);
+                if terrain {
+                    self.cam.dolly((-dz).exp());
+                } else {
+                    let anchor = resp
+                        .hover_pos()
+                        .map(|p| to_px(p, rect, ppp))
+                        .unwrap_or([self.view.size[0] / 2.0, self.view.size[1] / 2.0]);
+                    self.view.zoom_at(anchor, self.view.zoom + dz, MAX_ZOOM);
+                }
                 ui.ctx().request_repaint();
             }
             ui.ctx().set_cursor_icon(match editor.tool {
@@ -506,7 +802,7 @@ impl MapPanel {
     fn draw_chrome(
         &self,
         ui: &egui::Ui,
-        resp: &egui::Response,
+        cursor: Option<LngLat>,
         rect: Rect,
         ppp: f32,
         src: &TileSource,
@@ -517,14 +813,26 @@ impl MapPanel {
         };
 
         // Attribution is a licence requirement for every provider, so it is always on screen.
+        let shade = match self.mode {
+            ViewMode::Flat => &self.shade2d,
+            ViewMode::Terrain => &self.shade3d,
+        };
+        let uses_terrain = self.mode == ViewMode::Terrain
+            || shade.hillshade
+            || shade.slope
+            || self.cursor_elev.is_some();
+        let attribution = if uses_terrain {
+            format!("{} | {}", src.attribution, self.terrain_src.attribution)
+        } else {
+            src.attribution.clone()
+        };
         pill(
-            src.attribution.clone(),
+            attribution,
             Align2::RIGHT_BOTTOM,
             rect.right_bottom() - Vec2::new(10.0, 8.0),
         );
 
-        if let Some(p) = resp.hover_pos() {
-            let ll = self.screen_to_lnglat(p, rect, ppp);
+        if let Some(ll) = cursor {
             let text = match self.coord_format {
                 CoordFormat::Dd => smf_geo::format_dd(ll),
                 CoordFormat::Dms => smf_geo::format_dms(ll),
@@ -539,27 +847,36 @@ impl MapPanel {
             );
         }
 
-        // Scale bar: pick a round ground distance that is roughly 120 points wide.
-        let m_per_pt = meters_per_pixel(self.view.center.lat, self.view.zoom) * ppp as f64;
-        let (len_m, text) = nice_scale(m_per_pt * 120.0);
-        let width = (len_m / m_per_pt) as f32;
-        let base = rect.left_bottom() + Vec2::new(14.0, -42.0);
-        let stroke = Stroke::new(2.5, Color32::BLACK);
-        painter.line_segment(
-            [base, base + Vec2::new(width, 0.0)],
-            Stroke::new(5.0, Color32::from_white_alpha(200)),
-        );
-        painter.line_segment([base, base + Vec2::new(width, 0.0)], stroke);
-        painter.line_segment(
-            [base - Vec2::new(0.0, 5.0), base + Vec2::new(0.0, 5.0)],
-            stroke,
-        );
-        painter.line_segment(
-            [base + Vec2::new(width, -5.0), base + Vec2::new(width, 5.0)],
-            stroke,
-        );
-        pill(text, Align2::LEFT_BOTTOM, base + Vec2::new(0.0, -8.0));
+        if self.mode == ViewMode::Flat {
+            // Scale bar: pick a round ground distance that is roughly 120 points wide.
+            let m_per_pt = meters_per_pixel(self.view.center.lat, self.view.zoom) * ppp as f64;
+            let (len_m, text) = nice_scale(m_per_pt * 120.0);
+            let width = (len_m / m_per_pt) as f32;
+            let base = rect.left_bottom() + Vec2::new(14.0, -42.0);
+            let stroke = Stroke::new(2.5, Color32::BLACK);
+            painter.line_segment(
+                [base, base + Vec2::new(width, 0.0)],
+                Stroke::new(5.0, Color32::from_white_alpha(200)),
+            );
+            painter.line_segment([base, base + Vec2::new(width, 0.0)], stroke);
+            painter.line_segment(
+                [base - Vec2::new(0.0, 5.0), base + Vec2::new(0.0, 5.0)],
+                stroke,
+            );
+            painter.line_segment(
+                [base + Vec2::new(width, -5.0), base + Vec2::new(width, 5.0)],
+                stroke,
+            );
+            pill(text, Align2::LEFT_BOTTOM, base + Vec2::new(0.0, -8.0));
+        }
     }
+}
+
+fn to_px(p: Pos2, rect: Rect, ppp: f32) -> [f64; 2] {
+    [
+        ((p.x - rect.min.x) * ppp) as f64,
+        ((p.y - rect.min.y) * ppp) as f64,
+    ]
 }
 
 /// Snap to other features' vertices only; snapping a dragged vertex to itself would pin it in place.

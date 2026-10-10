@@ -79,7 +79,41 @@ impl FieldApp {
         } else if std::env::var_os("SMF_DEMO").is_some() {
             app.load_demo();
         }
+        app.apply_dev_env();
         app
+    }
+
+    /// Verification hooks. SMF_CAM="lng,lat,distance_m,pitch_deg,heading_deg" starts in 3D at that
+    /// camera; SMF_SLOPE=deg|fire turns on slope shading; SMF_SELECT=<feature name> selects it.
+    fn apply_dev_env(&mut self) {
+        if let Ok(v) = std::env::var("SMF_CAM") {
+            let n: Vec<f64> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+            if let [lng, lat, dist, pitch, heading] = n[..] {
+                self.map.view.center = LngLat::new(lng, lat);
+                self.map.cam.target = LngLat::new(lng, lat);
+                self.map.cam.distance_m = dist;
+                self.map.cam.pitch = pitch.to_radians();
+                self.map.cam.heading = heading.to_radians();
+                self.map.mode = map_panel::ViewMode::Terrain;
+            } else {
+                tracing::warn!("SMF_CAM needs 5 numbers: lng,lat,distance_m,pitch_deg,heading_deg");
+            }
+        }
+        if let Ok(v) = std::env::var("SMF_SLOPE") {
+            for p in [&mut self.map.shade2d, &mut self.map.shade3d] {
+                p.slope = true;
+                p.slope_fire_preset = v == "fire";
+            }
+        }
+        if let Ok(name) = std::env::var("SMF_SELECT") {
+            self.editor.selection = self
+                .editor
+                .project
+                .features
+                .iter()
+                .find(|f| f.name == name)
+                .map(|f| f.id);
+        }
     }
 
     fn dirty(&self) -> bool {

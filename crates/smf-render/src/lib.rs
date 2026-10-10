@@ -1,17 +1,26 @@
-//! wgpu 2D raster map renderer. Draws into its own offscreen texture so the same
+//! wgpu map renderer: 2D raster tiles with an optional hillshade/slope overlay,
+//! and a 3D draped-terrain view. Draws into its own offscreen texture so the same
 //! path serves the egui panel, headless tests and (later) print output.
 //! Knows nothing about egui or networking.
 
-use smf_geo::TileId;
-use std::collections::HashMap;
+mod pool;
+mod terrain;
 
+use smf_geo::TileId;
+use smf_terrain::{Camera3D, Chunk};
+
+pub use pool::{POOL_LAYERS, Resolved, TILE_PX, TilePool};
+pub use terrain::{
+    ChunkInstance, GRID, ShadeParams, ShadeVertex, Terrain3dPlan, TerrainFrame, height_id,
+    plan_shade_2d, plan_terrain, texel_meters,
+};
 pub use wgpu;
 
-pub const TILE_PX: u32 = 256;
-/// 256 is the default max array layers, so this works on every backend including WebGL2.
-const POOL_LAYERS: u32 = 256;
 /// sRGB so the 8-bit tile bytes are decoded to linear on sample and re-encoded on write.
 pub const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
+
+/// Pool key source id reserved for elevation tiles (imagery uses the caller's basemap index).
+pub const HEIGHT_SOURCE: u16 = 0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TileKey {
@@ -48,13 +57,12 @@ pub struct MapRenderer {
     queue: wgpu::Queue,
     pipeline: wgpu::RenderPipeline,
     bind_group: wgpu::BindGroup,
-    pool: wgpu::Texture,
+    imagery: TilePool,
+    heights: TilePool,
+    terrain: terrain::TerrainGpu,
     globals: wgpu::Buffer,
     vertices: wgpu::Buffer,
     vertex_capacity: u64,
-    layers: HashMap<TileKey, u32>,
-    layer_owner: Vec<Option<TileKey>>,
-    layer_used: Vec<u64>,
     frame: u64,
     target: Option<Target>,
     pub background: [f64; 4],
@@ -66,24 +74,8 @@ impl MapRenderer {
             label: Some("tiles"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/tiles.wgsl").into()),
         });
-        let pool = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("tile pool"),
-            size: wgpu::Extent3d {
-                width: TILE_PX,
-                height: TILE_PX,
-                depth_or_array_layers: POOL_LAYERS,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: FORMAT,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        let pool_view = pool.create_view(&wgpu::TextureViewDescriptor {
-            dimension: Some(wgpu::TextureViewDimension::D2Array),
-            ..Default::default()
-        });
+        let imagery = TilePool::new(device, "imagery pool", FORMAT, 4);
+        let heights = TilePool::new(device, "height pool", wgpu::TextureFormat::R32Float, 4);
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
@@ -136,7 +128,7 @@ impl MapRenderer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&pool_view),
+                    resource: wgpu::BindingResource::TextureView(imagery.view()),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
@@ -185,18 +177,18 @@ impl MapRenderer {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let terrain = terrain::TerrainGpu::new(device, &imagery, &heights, &sampler);
         Self {
             device: device.clone(),
             queue: queue.clone(),
             pipeline,
             bind_group,
-            pool,
+            imagery,
+            heights,
+            terrain,
             globals,
             vertices,
             vertex_capacity,
-            layers: HashMap::new(),
-            layer_owner: vec![None; POOL_LAYERS as usize],
-            layer_used: vec![0; POOL_LAYERS as usize],
             frame: 0,
             target: None,
             background: [0.82, 0.84, 0.86, 1.0],
@@ -207,58 +199,55 @@ impl MapRenderer {
         self.frame += 1;
     }
 
-    /// Pool layer for a resident tile; marks it used this frame so it isn't evicted.
+    /// Imagery layer for a resident tile; marks it used this frame so it isn't evicted.
     pub fn layer_of(&mut self, key: &TileKey) -> Option<u32> {
-        let l = *self.layers.get(key)?;
-        self.layer_used[l as usize] = self.frame;
-        Some(l)
+        self.imagery.touch(key, self.frame)
+    }
+
+    /// Resolve imagery for `key`, falling back to the nearest resident ancestor.
+    pub fn resolve_imagery(&mut self, key: &TileKey) -> Option<Resolved> {
+        self.imagery.resolve(key, self.frame)
     }
 
     pub fn resident_tiles(&self) -> usize {
-        self.layers.len()
+        self.imagery.len()
+    }
+
+    pub fn resident_heights(&self) -> usize {
+        self.heights.len()
+    }
+
+    pub fn has_height(&self, id: TileId) -> bool {
+        self.heights.contains(&TileKey {
+            source: HEIGHT_SOURCE,
+            id,
+        })
     }
 
     pub fn upload_tile(&mut self, key: TileKey, rgba: &[u8]) {
-        assert_eq!(rgba.len(), (TILE_PX * TILE_PX * 4) as usize);
-        let layer = match self.layers.get(&key) {
-            Some(&l) => l,
-            None => {
-                // Evict the least recently drawn layer (free layers have used == 0).
-                let l = (0..POOL_LAYERS as usize)
-                    .min_by_key(|&i| self.layer_used[i])
-                    .unwrap();
-                if let Some(old) = self.layer_owner[l].take() {
-                    self.layers.remove(&old);
-                }
-                self.layer_owner[l] = Some(key);
-                self.layers.insert(key, l as u32);
-                l as u32
-            }
-        };
-        self.layer_used[layer as usize] = self.frame;
-        self.queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &self.pool,
-                mip_level: 0,
-                origin: wgpu::Origin3d {
-                    x: 0,
-                    y: 0,
-                    z: layer,
-                },
-                aspect: wgpu::TextureAspect::All,
+        self.imagery.upload(&self.queue, key, rgba, self.frame);
+    }
+
+    /// Upload a 256x256 elevation tile in metres.
+    pub fn upload_height(&mut self, id: TileId, heights: &[f32]) {
+        self.heights.upload(
+            &self.queue,
+            TileKey {
+                source: HEIGHT_SOURCE,
+                id,
             },
-            rgba,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(TILE_PX * 4),
-                rows_per_image: Some(TILE_PX),
-            },
-            wgpu::Extent3d {
-                width: TILE_PX,
-                height: TILE_PX,
-                depth_or_array_layers: 1,
-            },
+            bytemuck::cast_slice(heights),
+            self.frame,
         );
+    }
+
+    /// Overlay geometry for the 2D hillshade/slope pass, plus the elevation tiles still needed.
+    pub fn plan_shade(
+        &mut self,
+        view: &smf_geo::MapView,
+        tz: u8,
+    ) -> (Vec<ShadeVertex>, Vec<(TileKey, f32)>) {
+        plan_shade_2d(view, tz, &mut self.heights, self.frame)
     }
 
     /// True when the target had to be (re)created; the host must re-register it with egui.
@@ -292,7 +281,17 @@ impl MapRenderer {
         self.target.as_ref().map(|t| &t.view)
     }
 
+    pub fn target_size(&self) -> Option<[u32; 2]> {
+        self.target.as_ref().map(|t| t.size)
+    }
+
+    /// Plain 2D frame without terrain shading.
     pub fn render(&mut self, quads: &[TileQuad]) {
+        self.render_2d(quads, &[], &ShadeParams::default());
+    }
+
+    /// 2D basemap quads, then (when enabled) the hillshade/slope overlay on top.
+    pub fn render_2d(&mut self, quads: &[TileQuad], shade: &[ShadeVertex], params: &ShadeParams) {
         let Some(target) = &self.target else { return };
         let size = target.size;
         self.queue.write_buffer(
@@ -348,8 +347,39 @@ impl MapRenderer {
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.set_vertex_buffer(0, self.vertices.slice(..));
             pass.draw(0..verts.len() as u32, 0..1);
+            self.terrain
+                .draw_shade(&self.device, &self.queue, &mut pass, size, params, shade);
         }
         self.queue.submit(Some(enc.finish()));
+    }
+
+    /// Plan and draw a 3D frame. Returns the plan so the caller can issue tile requests.
+    pub fn render_3d(
+        &mut self,
+        cam: &Camera3D,
+        chunks: &[Chunk],
+        source: u16,
+        params: &ShadeParams,
+    ) -> Terrain3dPlan {
+        let plan = plan_terrain(
+            cam,
+            chunks,
+            source,
+            &mut self.imagery,
+            &mut self.heights,
+            self.frame,
+        );
+        if let Some(t) = &self.target {
+            self.terrain.render_3d(
+                &self.device,
+                &self.queue,
+                &t.view,
+                t.size,
+                &plan.frame,
+                params,
+            );
+        }
+        plan
     }
 
     /// Copy the target back to the CPU as tightly packed RGBA8 (tests / print).
@@ -405,6 +435,8 @@ pub struct FramePlan {
     pub quads: Vec<TileQuad>,
     /// (key, priority) with lower priority loading first.
     pub requests: Vec<(TileKey, f32)>,
+    /// Zoom level the tiles were laid out at.
+    pub tile_zoom: u8,
 }
 
 pub fn plan_frame(
@@ -417,51 +449,45 @@ pub fn plan_frame(
     let mut quads = Vec::new();
     let mut requests = Vec::new();
     let mut tiles = view.visible_tiles(tz);
-    // Draw ancestors first-class: sort so nearest-to-centre tiles are requested first.
+    // Nearest-to-centre tiles are requested first.
     tiles.sort_by(|a, b| {
         view.tile_distance(tz, a.x, a.y)
             .total_cmp(&view.tile_distance(tz, b.x, b.y))
     });
     for t in tiles {
-        let wx = smf_geo::wrap_x(t.x, tz);
-        let id = TileId::new(tz, wx, t.y);
+        let id = TileId::new(tz, smf_geo::wrap_x(t.x, tz), t.y);
         let dist = view.tile_distance(tz, t.x, t.y) as f32;
-        let corners32 = |c: [[f64; 2]; 4]| c.map(|p| [p[0] as f32, p[1] as f32]);
-        let corners = corners32(view.tile_corners(tz, t.x, t.y));
-        if let Some(layer) = r.layer_of(&TileKey { source, id }) {
+        let corners = view
+            .tile_corners(tz, t.x, t.y)
+            .map(|p| [p[0] as f32, p[1] as f32]);
+        let key = TileKey { source, id };
+        let res = r.resolve_imagery(&key);
+        if let Some(res) = res {
             quads.push(TileQuad {
                 corners,
-                uv: [0.0, 0.0, 1.0, 1.0],
-                layer,
+                uv: [res.u0, res.v0, res.u0 + res.scale, res.v0 + res.scale],
+                layer: res.layer,
             });
-            continue;
         }
-        requests.push((TileKey { source, id }, dist));
-        // Walk up for the nearest resident ancestor and draw its matching sub-rect.
-        let mut anc = id;
-        let mut found = false;
-        while let Some(p) = anc.parent() {
-            anc = p;
-            if let Some(layer) = r.layer_of(&TileKey { source, id: anc }) {
-                let shift = tz - anc.z;
-                let span = 1u32 << shift;
-                let u0 = (id.x - (anc.x << shift)) as f32 / span as f32;
-                let v0 = (id.y - (anc.y << shift)) as f32 / span as f32;
-                let d = 1.0 / span as f32;
-                quads.push(TileQuad {
-                    corners,
-                    uv: [u0, v0, u0 + d, v0 + d],
-                    layer,
-                });
-                found = true;
-                break;
-            }
+        if !res.is_some_and(|x| x.is_exact()) {
+            requests.push((key, dist));
             // Low-zoom ancestors are tiny and load first so a fallback exists almost immediately.
-            requests.push((TileKey { source, id: anc }, dist - 10_000.0 + anc.z as f32));
+            let mut anc = id;
+            while let Some(p) = anc.parent() {
+                anc = p;
+                let k = TileKey { source, id: anc };
+                if r.imagery.contains(&k) {
+                    break;
+                }
+                requests.push((k, dist - 10_000.0 + anc.z as f32));
+            }
         }
-        let _ = found;
     }
-    FramePlan { quads, requests }
+    FramePlan {
+        quads,
+        requests,
+        tile_zoom: tz,
+    }
 }
 
 #[cfg(test)]
@@ -481,6 +507,11 @@ mod tests {
 
     fn solid(r: u8, g: u8, b: u8) -> Vec<u8> {
         [r, g, b, 255].repeat((TILE_PX * TILE_PX) as usize)
+    }
+
+    fn px(buf: &[u8], w: usize, x: usize, y: usize) -> [u8; 4] {
+        let i = (y * w + x) * 4;
+        [buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]
     }
 
     /// Renders a resident z1 tile and an ancestor fallback, then checks pixels read back from the GPU.
@@ -510,10 +541,13 @@ mod tests {
             "should request z2 tiles"
         );
         r.render(&plan.quads);
-        let px = r.read_pixels().unwrap();
-        let at = |x: usize, y: usize| &px[(y * 256 + x) * 4..(y * 256 + x) * 4 + 4];
-        assert_eq!(at(128, 128), &[255, 0, 0, 255], "fallback ancestor pixel");
-        assert_eq!(at(5, 250), &[255, 0, 0, 255]);
+        let p = r.read_pixels().unwrap();
+        assert_eq!(
+            px(&p, 256, 128, 128),
+            [255, 0, 0, 255],
+            "fallback ancestor pixel"
+        );
+        assert_eq!(px(&p, 256, 5, 250), [255, 0, 0, 255]);
 
         // Now a resident z2 tile of pure green replaces the fallback where it lies.
         r.begin_frame();
@@ -526,13 +560,219 @@ mod tests {
         );
         let plan = plan_frame(&mut r, &view, 0, 19);
         r.render(&plan.quads);
-        let px = r.read_pixels().unwrap();
-        let at = |x: usize, y: usize| &px[(y * 256 + x) * 4..(y * 256 + x) * 4 + 4];
+        let p = r.read_pixels().unwrap();
         assert_eq!(
-            at(192, 192),
-            &[0, 255, 0, 255],
+            px(&p, 256, 192, 192),
+            [0, 255, 0, 255],
             "z2 tile (2,2) covers SE of centre"
         );
-        assert_eq!(at(64, 64), &[255, 0, 0, 255], "NW still the fallback");
+        assert_eq!(
+            px(&p, 256, 64, 64),
+            [255, 0, 0, 255],
+            "NW still the fallback"
+        );
+    }
+
+    /// A 45 degree ramp rising east: slope shading must classify it as the steepest class,
+    /// and flat ground must be left untouched. Verifies the shader's normals, texel scale and
+    /// the 2D overlay path on a real GPU.
+    #[test]
+    fn slope_overlay_classifies_ramp_and_ignores_flat() {
+        let Some((device, queue)) = headless() else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let lat = 38.6;
+        let id = TileId::from_lnglat(LngLat::new(-92.3, lat), 10);
+        let b = smf_terrain::tile_bounds_mercator(id);
+        let center = smf_geo::mercator_to_lnglat((b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0);
+        let texel = texel_meters(10, center.lat);
+        let mut ramp = vec![0f32; 256 * 256];
+        for y in 0..256 {
+            for x in 0..256 {
+                ramp[y * 256 + x] = x as f32 * texel; // rise == run: 45 degrees
+            }
+        }
+        let mut r = MapRenderer::new(&device, &queue);
+        r.background = [0.0, 0.0, 0.0, 1.0];
+        r.ensure_target([256, 256]);
+        r.begin_frame();
+        r.upload_tile(TileKey { source: 1, id }, &solid(0, 0, 255));
+        r.upload_height(id, &ramp);
+        let view = MapView::new(center, 10.0, [256.0, 256.0]);
+        let params = ShadeParams {
+            slope: true,
+            slope_alpha: 1.0,
+            ..Default::default()
+        };
+        let plan = plan_frame(&mut r, &view, 1, 19);
+        let (shade, _) = plan_shade_2d(&view, plan.tile_zoom, &mut r.heights, r.frame);
+        assert!(!shade.is_empty());
+        r.render_2d(&plan.quads, &shade, &params);
+        let p = r.read_pixels().unwrap();
+        let c = px(&p, 256, 128, 128);
+        // Steepest class is purple (0.55, 0.10, 0.75) -> sRGB ~ (194, 89, 225).
+        assert!(
+            c[0] > 150 && c[2] > 180 && c[1] < 130,
+            "45 degree ramp should be purple, got {c:?}"
+        );
+
+        // Same view with flat terrain: no overlay, so the blue basemap shows through.
+        r.begin_frame();
+        r.upload_height(id, &vec![100.0f32; 256 * 256]);
+        let plan = plan_frame(&mut r, &view, 1, 19);
+        let (shade, _) = plan_shade_2d(&view, plan.tile_zoom, &mut r.heights, r.frame);
+        r.render_2d(&plan.quads, &shade, &params);
+        let p = r.read_pixels().unwrap();
+        assert_eq!(
+            px(&p, 256, 128, 128),
+            [0, 0, 255, 255],
+            "flat ground must be unshaded"
+        );
+    }
+
+    /// Hillshade: a slope facing the sun is brighter than one facing away.
+    #[test]
+    fn hillshade_depends_on_aspect() {
+        let Some((device, queue)) = headless() else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let id = TileId::from_lnglat(LngLat::new(-92.3, 38.6), 10);
+        let b = smf_terrain::tile_bounds_mercator(id);
+        let center = smf_geo::mercator_to_lnglat((b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0);
+        let texel = texel_meters(10, center.lat);
+        // Height rises to the east (~20 degrees), so the surface faces west.
+        let ramp: Vec<f32> = (0..256 * 256)
+            .map(|i| (i % 256) as f32 * texel * 0.36)
+            .collect();
+        let render_with_sun = |az: f32| {
+            let mut r = MapRenderer::new(&device, &queue);
+            r.background = [0.0, 0.0, 0.0, 1.0];
+            r.ensure_target([128, 128]);
+            r.begin_frame();
+            r.upload_tile(TileKey { source: 1, id }, &solid(128, 128, 128));
+            r.upload_height(id, &ramp);
+            let view = MapView::new(center, 10.0, [128.0, 128.0]);
+            let params = ShadeParams {
+                hillshade: true,
+                hill_strength: 1.0,
+                sun_azimuth_deg: az,
+                sun_altitude_deg: 35.0,
+                ..Default::default()
+            };
+            let plan = plan_frame(&mut r, &view, 1, 19);
+            let (shade, _) = plan_shade_2d(&view, plan.tile_zoom, &mut r.heights, r.frame);
+            r.render_2d(&plan.quads, &shade, &params);
+            let p = r.read_pixels().unwrap();
+            px(&p, 128, 64, 64)[0]
+        };
+        // Surface rises eastward, so it faces west: a sun in the west (270) lights it, east (90) doesn't.
+        let lit = render_with_sun(270.0);
+        let dark = render_with_sun(90.0);
+        assert!(
+            lit > dark + 40,
+            "west-facing slope: sun W = {lit}, sun E = {dark}"
+        );
+    }
+
+    /// 3D: a flat tile seen from above shows its imagery; a steep ramp gets the slope class colour,
+    /// proving the terrain pipeline, instancing, depth buffer and camera matrices work end to end.
+    #[test]
+    fn terrain_3d_draws_draped_imagery_and_shading() {
+        let Some((device, queue)) = headless() else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let target = LngLat::new(-92.3, 38.6);
+        let id = TileId::from_lnglat(target, 10);
+        let b = smf_terrain::tile_bounds_mercator(id);
+        let center = smf_geo::mercator_to_lnglat((b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0);
+        let mut cam = Camera3D {
+            target: center,
+            target_elev_m: 100.0,
+            distance_m: 20_000.0,
+            pitch: 89.0f64.to_radians(),
+            viewport: [128.0, 128.0],
+            ..Camera3D::default()
+        };
+        cam.heading = 0.0;
+        let chunks = [Chunk { id }];
+
+        let mut r = MapRenderer::new(&device, &queue);
+        r.ensure_target([128, 128]);
+        r.begin_frame();
+        r.upload_tile(TileKey { source: 1, id }, &solid(0, 200, 0));
+        r.upload_height(id, &vec![100.0f32; 256 * 256]);
+        let plan = r.render_3d(&cam, &chunks, 1, &ShadeParams::default());
+        assert_eq!(plan.frame.instances.len(), 1);
+        let p = r.read_pixels().unwrap();
+        assert_eq!(
+            px(&p, 128, 64, 64),
+            [0, 200, 0, 255],
+            "imagery draped on flat terrain"
+        );
+        // Corner of the frame should still see this tile or sky; the sky colour is the clear colour.
+        let sky = px(&p, 128, 0, 0);
+        assert!(sky[3] == 255);
+
+        // Steep ramp + slope overlay.
+        let texel = texel_meters(10, center.lat);
+        let ramp: Vec<f32> = (0..256 * 256).map(|i| (i % 256) as f32 * texel).collect();
+        r.begin_frame();
+        r.upload_height(id, &ramp);
+        let params = ShadeParams {
+            slope: true,
+            slope_alpha: 1.0,
+            ..Default::default()
+        };
+        let _ = r.render_3d(&cam, &chunks, 1, &params);
+        let p = r.read_pixels().unwrap();
+        let c = px(&p, 128, 64, 64);
+        assert!(
+            c[0] > 150 && c[2] > 150,
+            "steep slope should be purple-ish in 3D, got {c:?}"
+        );
+    }
+
+    /// Looking from the side at a mountain: terrain in front must hide terrain behind it (depth test).
+    #[test]
+    fn terrain_3d_depth_ordering() {
+        let Some((device, queue)) = headless() else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let id = TileId::from_lnglat(LngLat::new(-92.3, 38.6), 10);
+        let b = smf_terrain::tile_bounds_mercator(id);
+        let center = smf_geo::mercator_to_lnglat((b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0);
+        // A tall wall across the middle rows of the tile.
+        let mut h = vec![0f32; 256 * 256];
+        for y in 120..136 {
+            for x in 0..256 {
+                h[y * 256 + x] = 3000.0;
+            }
+        }
+        let cam = Camera3D {
+            target: center,
+            target_elev_m: 0.0,
+            distance_m: 40_000.0,
+            pitch: 8.0f64.to_radians(),
+            heading: 0.0,
+            viewport: [128.0, 128.0],
+            ..Camera3D::default()
+        };
+        let mut r = MapRenderer::new(&device, &queue);
+        r.ensure_target([128, 128]);
+        r.begin_frame();
+        r.upload_tile(TileKey { source: 1, id }, &solid(200, 0, 0));
+        r.upload_height(id, &h);
+        let _ = r.render_3d(&cam, &[Chunk { id }], 1, &ShadeParams::default());
+        let p = r.read_pixels().unwrap();
+        // Something red (terrain) must be visible, and it must not be the whole frame (sky above).
+        let red = (0..128 * 128)
+            .filter(|i| p[i * 4] == 200 && p[i * 4 + 1] == 0)
+            .count();
+        assert!(red > 50, "terrain should be visible, red px = {red}");
+        assert!(red < 128 * 128, "sky should be visible above the horizon");
     }
 }

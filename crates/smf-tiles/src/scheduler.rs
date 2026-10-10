@@ -247,6 +247,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("smf-sched-test-{}", std::process::id()));
         let svc = TileService::new(dir.clone(), || {});
         let src = Arc::new(TileSource {
+            kind: Default::default(),
             id: "t".into(),
             name: "t".into(),
             url: format!("http://127.0.0.1:{port}/{{z}}/{{x}}/{{y}}"),
