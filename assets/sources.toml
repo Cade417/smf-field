@@ -1,0 +1,51 @@
+# Default basemap catalog. offline_allowed=false sources are never bulk-downloaded
+# (OSM/OpenTopoMap policy, Esri World Imagery terms). USGS National Map is public domain.
+
+[[source]]
+id = "usgs-topo"
+name = "USGS Topo"
+url = "https://basemap.nationalmap.gov/arcgis/rest/services/USGSTopo/MapServer/tile/{z}/{y}/{x}"
+max_zoom = 16
+attribution = "USGS The National Map"
+offline_allowed = true
+
+[[source]]
+id = "usgs-imagery"
+name = "USGS Imagery"
+url = "https://basemap.nationalmap.gov/arcgis/rest/services/USGSImageryOnly/MapServer/tile/{z}/{y}/{x}"
+max_zoom = 16
+attribution = "USGS The National Map"
+offline_allowed = true
+
+[[source]]
+id = "usgs-imagery-topo"
+name = "USGS Imagery + Topo"
+url = "https://basemap.nationalmap.gov/arcgis/rest/services/USGSImageryTopo/MapServer/tile/{z}/{y}/{x}"
+max_zoom = 16
+attribution = "USGS The National Map"
+offline_allowed = true
+
+[[source]]
+id = "esri-imagery"
+name = "Esri World Imagery"
+url = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
+max_zoom = 19
+attribution = "Esri, Maxar, Earthstar Geographics"
+offline_allowed = false
+
+[[source]]
+id = "opentopomap"
+name = "OpenTopoMap"
+url = "https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png"
+subdomains = ["a", "b", "c"]
+max_zoom = 17
+attribution = "OpenTopoMap (CC-BY-SA), OpenStreetMap contributors"
+offline_allowed = false
+
+[[source]]
+id = "osm"
+name = "OpenStreetMap"
+url = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+max_zoom = 19
+attribution = "OpenStreetMap contributors"
+offline_allowed = false
