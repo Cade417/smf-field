@@ -10,6 +10,7 @@ use crate::layers_ui::{ActiveDownload, DownloadUi, OverlayLayer};
 use crate::live_ui::LiveState;
 use crate::print_ui::PrintUi;
 use crate::smf_ui::SmfState;
+use crate::team_ui::TeamState;
 use crate::trails_ui::TrailState;
 use crate::w3w_ui::W3wState;
 use crate::{overlay, panels};
@@ -137,6 +138,7 @@ pub struct MapPanel {
     pub(crate) ext: ExtState,
     pub(crate) gps: GpsState,
     pub(crate) live: LiveState,
+    pub(crate) team: TeamState,
     /// Nearest vertex of the selected feature while navigating (set each frame for drawing).
     pub(crate) gps_target: Option<(LngLat, String)>,
     pub(crate) earth: EarthUi,
@@ -219,6 +221,7 @@ impl MapPanel {
             ext: ExtState::new(),
             gps: GpsState::new(),
             live: LiveState::new(),
+            team: TeamState::new(),
             gps_target: None,
             earth: EarthUi::default(),
             trails: TrailState::new(),
@@ -294,6 +297,7 @@ impl MapPanel {
         self.poll_ext(ui.ctx());
         self.poll_gps(ui.ctx());
         self.poll_live(ui.ctx());
+        self.team_tick(ui.ctx(), editor);
         self.poll_trails(ui.ctx());
         self.trails_dev(editor);
         if let Some(ll) = self.dev_conditions.take() {
@@ -321,6 +325,7 @@ impl MapPanel {
                 ui.menu_button("Fire & snow", |ui| self.ext_menu(ui));
                 ui.menu_button("GPS", |ui| self.gps_menu(ui, editor));
                 ui.menu_button("Tracking", |ui| self.live_menu(ui));
+                ui.menu_button("Team", |ui| self.team_menu(ui, editor));
                 ui.menu_button("Offline", |ui| self.offline_menu(ui));
                 ui.menu_button("Shading", |ui| self.shading_menu(ui));
                 self.w3w_toolbar(ui, editor);
@@ -552,6 +557,7 @@ impl MapPanel {
         self.draw_smf_data(&painter, &pj, rect);
         self.draw_ext(&painter, &pj, rect);
         self.draw_live(&painter, &pj, rect);
+        self.draw_team(&painter, &pj, rect);
         self.draw_gps(&painter, &pj);
         self.draw_w3w(&painter, &pj, rect);
         overlay::draw_project(&painter, &pj, editor);
@@ -944,7 +950,8 @@ impl MapPanel {
                         // Nothing of the user's under the pointer: offer live Show Me Fire data instead.
                         self.smf.info = Self::smf_pick(&self.smf, &project, pt, tol);
                         if self.smf.info.is_none()
-                            && let Some(t) = Self::live_pick(&self.live, &project, pt, tol)
+                            && let Some(t) = Self::team_pick(&self.team, &project, pt, tol)
+                                .or_else(|| Self::live_pick(&self.live, &project, pt, tol))
                                 .or_else(|| Self::ext_pick(&self.ext, &project, pt, tol))
                         {
                             self.notice = Some((t, Instant::now()));

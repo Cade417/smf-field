@@ -3643,6 +3643,7 @@ dependencies = [
  "rustls-pki-types",
  "rustls-platform-verifier",
  "serde",
+ "serde_json",
  "serde_urlencoded",
  "sync_wrapper",
  "tokio",
@@ -4159,6 +4160,7 @@ dependencies = [
  "smf-print",
  "smf-render",
  "smf-route",
+ "smf-sync",
  "smf-terrain",
  "smf-tiles",
  "smf-w3w",
@@ -4280,6 +4282,17 @@ version = "0.1.0"
 dependencies = [
  "reqwest",
  "serde_json",
+ "smf-geo",
+]
+
+[[package]]
+name = "smf-sync"
+version = "0.1.0"
+dependencies = [
+ "reqwest",
+ "serde",
+ "serde_json",
+ "smf-features",
  "smf-geo",
 ]
 

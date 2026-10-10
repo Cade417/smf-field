@@ -26,6 +26,7 @@ smf-ext.workspace = true
 smf-route.workspace = true
 smf-gps.workspace = true
 smf-live.workspace = true
+smf-sync.workspace = true
 eframe.workspace = true
 anyhow.workspace = true
 tracing.workspace = true

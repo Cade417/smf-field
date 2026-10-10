@@ -23,6 +23,21 @@ not a monorepo).
   mode; the app refuses to bulk-download sources whose terms forbid it.
 - **Custom layers**: XYZ/TMS URLs, WMS, local MBTiles, local GeoTIFF; overlays with opacity in 2D
   and draped in 3D.
+- **Terrain analysis**: slope angle and aspect under the pointer, vertical gain and loss on measured
+  lines and elevation profiles.
+- **Snap to trails**: while drawing lines and polygons, clicks follow the OpenStreetMap trail network
+  (routed along trails, not straight across).
+- **Fire history and snow gauges**: NIFC historical fire perimeters and NRCS SNOTEL snow readings,
+  fetched for the visible area; click a perimeter or gauge for details.
+- **Google Earth**: export the view as a KML SuperOverlay (KMZ) that loads detail as you zoom.
+- **GPS navigation**: position from the Windows location service, a serial NMEA device, gpsd or a
+  replayed NMEA log; follow mode, track recording (saved as a line), and distance/bearing to the
+  selected feature.
+- **Live tracking**: Garmin inReach MapShare feeds and APRS-IS stations (read-only) as labelled
+  markers with a short trail and the age of the last report.
+- **Team collaboration**: sign in to a Show Me Fire team (join code), share a map that everyone
+  edits live, and optionally share your GPS position. Needs the `/api/field/v1` service from the
+  Show Me Fire API (see that repo's `docs/field_collab.md`).
 - **what3words** (needs your own API key): type `///word.word.word` in the toolbar to fly to the
   3 m square, show three-word addresses in the cursor readout (the `///` coordinate mode), and
   switch on a 3 m grid layer when zoomed in. Enter the key under what3words > API key; it is stored
@@ -63,6 +78,11 @@ hands-on testing.
 | `smf-print` | page layout, PDF writer, scale-accurate rendering, GeoTIFF export |
 | `smf-data` | Show Me Fire client, layers, background refresher, forecast, snapshots |
 | `smf-w3w` | what3words v3 client and three-word parsing |
+| `smf-ext` | NIFC fire-history and SNOTEL snow-gauge fetching |
+| `smf-route` | OpenStreetMap trail graph and routing |
+| `smf-gps` | NMEA parsing and GPS sources (serial, gpsd, replay, Windows location) |
+| `smf-live` | inReach MapShare and APRS-IS tracking |
+| `smf-sync` | team collaboration client, sync engine and workers |
 | `smf-app` | the egui application |
 
 Only `smf-app` depends on egui; tokio is not used (blocking HTTP on worker threads).
@@ -73,7 +93,7 @@ Visual checks use the app's own rendering, never an OS screen capture (that reco
 `SMF_SCREENSHOT=out.png` (+`SMF_SCREENSHOT_SECS`), `SMF_VIEW=lng,lat,zoom`, `SMF_CAM=...` (3D),
 `SMF_DEMO=1`, `SMF_IMPORT=a;b`, `SMF_DOWNLOAD=...`, `SMF_OFFLINE=1`, `SMF_LAYER=file[@opacity]`,
 `SMF_PRINT=out.pdf[,scale,dpi]` (+`SMF_PRINT_DELAY`), `SMF_GEOTIFF=out.tif[,zoom,half_span]`,
-`SMF_W3W_SEARCH=a.b.c`/`SMF_W3W_GRID=1`/`SMF_W3W_HOVER=lng,lat` (+`W3W_API_KEY`, `SMF_W3W_BASE`), `SMF_INFO=<layer>`, `SMF_COND=lng,lat`, `SMF_FORECAST=<hours>`, `SMF_ABOUT=1`. Hooks that set a
+`SMF_W3W_SEARCH=a.b.c`/`SMF_W3W_GRID=1`/`SMF_W3W_HOVER=lng,lat` (+`W3W_API_KEY`, `SMF_W3W_BASE`), `SMF_EXT=history,snow`, `SMF_TRAIL_ROUTE=...` (+`SMF_TRAILS_FILE`), `SMF_EARTH=out.kmz[,zoom,levels]`, `SMF_GPS=...`, `SMF_GPS_RECORD=1`, `SMF_LIVE=...`, `SMF_TEAM=url|code|name[|map]`, `SMF_INFO=<layer>`, `SMF_COND=lng,lat`, `SMF_FORECAST=<hours>`, `SMF_ABOUT=1`. Hooks that set a
 non-interactive run suppress modal dialogs.
 
 ## Known limits
@@ -85,6 +105,15 @@ non-interactive run suppress modal dialogs.
   with a message instead of being misplaced.
 - what3words was verified against a local mock of the documented v3 API, not the live service;
   the grid is not included in printed maps.
+- Team collaboration is last-writer-wins per feature, shares features (not folders), and needs the
+  server; there is no offline editing queue beyond retrying while the app is open. Teammates' changes
+  arrive within about a second. Sign-ins, inReach passwords and the what3words key are saved
+  unencrypted in the settings folder.
+- Snap to trails depends on the public Overpass servers, which are sometimes busy (the app retries
+  and tries mirrors). APRS Mic-E packets are not decoded. inReach parsing follows Garmin's documented
+  feed fields but was not checked against a live feed. The KMZ export was validated structurally,
+  not opened in Google Earth. Serial GPS was tested with a replayed log and a gpsd test server, not
+  a hardware receiver.
 - Vector basemaps (Protomaps) and WASM/web builds are not implemented.
 - Live incident markers are not clustered when zoomed far out.
 - Installer packaging (`[package.metadata.packager]`) and the release workflow are configured but
