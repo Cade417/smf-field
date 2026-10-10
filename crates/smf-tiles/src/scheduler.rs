@@ -106,7 +106,7 @@ impl TileService {
             .user_agent(concat!(
                 "ShowMeFireField/",
                 env!("CARGO_PKG_VERSION"),
-                " (cwoolaway@centralcrossingfpd.org)"
+                " (+https://showmefire.org)"
             ))
             .timeout(Duration::from_secs(20))
             .build()
