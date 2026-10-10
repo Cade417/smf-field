@@ -7,6 +7,7 @@ use crate::ext_ui::ExtState;
 use crate::gps_ui::GpsState;
 use crate::layers::LayerStore;
 use crate::layers_ui::{ActiveDownload, DownloadUi, OverlayLayer};
+use crate::live_ui::LiveState;
 use crate::print_ui::PrintUi;
 use crate::smf_ui::SmfState;
 use crate::trails_ui::TrailState;
@@ -135,6 +136,7 @@ pub struct MapPanel {
     pub(crate) w3w: W3wState,
     pub(crate) ext: ExtState,
     pub(crate) gps: GpsState,
+    pub(crate) live: LiveState,
     /// Nearest vertex of the selected feature while navigating (set each frame for drawing).
     pub(crate) gps_target: Option<(LngLat, String)>,
     pub(crate) earth: EarthUi,
@@ -216,6 +218,7 @@ impl MapPanel {
             w3w: W3wState::new(),
             ext: ExtState::new(),
             gps: GpsState::new(),
+            live: LiveState::new(),
             gps_target: None,
             earth: EarthUi::default(),
             trails: TrailState::new(),
@@ -290,6 +293,7 @@ impl MapPanel {
         self.poll_w3w(ui.ctx());
         self.poll_ext(ui.ctx());
         self.poll_gps(ui.ctx());
+        self.poll_live(ui.ctx());
         self.poll_trails(ui.ctx());
         self.trails_dev(editor);
         if let Some(ll) = self.dev_conditions.take() {
@@ -316,6 +320,7 @@ impl MapPanel {
                 ui.menu_button("Layers", |ui| self.layers_menu(ui));
                 ui.menu_button("Fire & snow", |ui| self.ext_menu(ui));
                 ui.menu_button("GPS", |ui| self.gps_menu(ui, editor));
+                ui.menu_button("Tracking", |ui| self.live_menu(ui));
                 ui.menu_button("Offline", |ui| self.offline_menu(ui));
                 ui.menu_button("Shading", |ui| self.shading_menu(ui));
                 self.w3w_toolbar(ui, editor);
@@ -452,6 +457,7 @@ impl MapPanel {
         self.print_window(ui.ctx(), editor);
         self.smf_windows(ui.ctx(), editor);
         self.w3w_window(ui.ctx());
+        self.live_window(ui.ctx());
         self.earth_window(ui.ctx());
     }
 
@@ -545,6 +551,7 @@ impl MapPanel {
         };
         self.draw_smf_data(&painter, &pj, rect);
         self.draw_ext(&painter, &pj, rect);
+        self.draw_live(&painter, &pj, rect);
         self.draw_gps(&painter, &pj);
         self.draw_w3w(&painter, &pj, rect);
         overlay::draw_project(&painter, &pj, editor);
@@ -937,7 +944,8 @@ impl MapPanel {
                         // Nothing of the user's under the pointer: offer live Show Me Fire data instead.
                         self.smf.info = Self::smf_pick(&self.smf, &project, pt, tol);
                         if self.smf.info.is_none()
-                            && let Some(t) = Self::ext_pick(&self.ext, &project, pt, tol)
+                            && let Some(t) = Self::live_pick(&self.live, &project, pt, tol)
+                                .or_else(|| Self::ext_pick(&self.ext, &project, pt, tol))
                         {
                             self.notice = Some((t, Instant::now()));
                         }
@@ -1038,6 +1046,10 @@ impl MapPanel {
         };
         if self.coord_format == CoordFormat::W3w || self.w3w.grid_on || self.w3w.found.is_some() {
             attribution.push_str(" | what3words");
+        }
+        if let Some(c) = self.live_credit() {
+            attribution.push_str(" | ");
+            attribution.push_str(c);
         }
         if let Some(c) = self.trails_credit() {
             attribution.push_str(" | ");

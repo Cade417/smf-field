@@ -1,0 +1,14 @@
+[package]
+name = "smf-live"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+smf-ext.workspace = true
+roxmltree = "0.20"
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls", "query"] }
