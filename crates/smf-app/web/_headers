@@ -1,0 +1,8 @@
+# Cloudflare Pages response headers for the web build (copied into dist/ by trunk).
+# Trunk puts a content hash in the .js/.wasm file names, so Pages' default caching
+# (revalidate with ETag) is already correct and no Cache-Control rules are needed here.
+# GPS > "This device" uses the browser's location; no other device permission is needed.
+/*
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: strict-origin-when-cross-origin
+  Permissions-Policy: geolocation=(self), camera=(), microphone=(), payment=()

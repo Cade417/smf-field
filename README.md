@@ -62,6 +62,9 @@ cargo run -p xtask -- check-shaders   # validate the WGSL shaders
 The Show Me Fire server is `https://api.showmefire.org`; set `SMF_API_BASE=http://localhost:8000`
 to use a local API (reuse an already running dev server rather than starting another one).
 
+How to run the desktop and web apps and deploy the web app to Cloudflare Pages:
+[docs/RUNNING_AND_DEPLOYING.md](docs/RUNNING_AND_DEPLOYING.md).
+
 Windows is the primary development platform; macOS and Linux are built in CI but have had less
 hands-on testing.
 
@@ -114,7 +117,8 @@ non-interactive run suppress modal dialogs.
   feed fields but was not checked against a live feed. The KMZ export was validated structurally,
   not opened in Google Earth. Serial GPS was tested with a replayed log and a gpsd test server, not
   a hardware receiver.
-- Vector basemaps (Protomaps) and WASM/web builds are not implemented.
+- Vector basemaps (Protomaps) are not implemented. The web build lacks offline areas, KMZ
+  SuperOverlay export, shapefiles, local raster layers, serial/gpsd GPS and APRS/inReach.
 - Live incident markers are not clustered when zoomed far out.
 - Installer packaging (`[package.metadata.packager]`) and the release workflow are configured but
   have not been exercised on clean machines; signed installers are not produced.
