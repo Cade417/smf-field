@@ -695,7 +695,7 @@ mod tests {
         for col in 0..out.width {
             let world_col = first_col + col as u64;
             let tile_x = (world_col / 256) as u32;
-            let want_red = tile_x % 2 == 0;
+            let want_red = tile_x.is_multiple_of(2);
             let got = out.pixel(col, row);
             assert_eq!(
                 got[0] > 128,
@@ -710,7 +710,7 @@ mod tests {
             let got = out.pixel(col, r_);
             assert_eq!(
                 got[1] > 128,
-                tile_y % 2 == 0,
+                tile_y.is_multiple_of(2),
                 "row {r_} (world row {world_row}, tile y {tile_y}): {got:?}"
             );
         }
