@@ -9,6 +9,13 @@ pub fn distance_m(a: LngLat, b: LngLat) -> f64 {
     Geodesic::wgs84().inverse(a.lat, a.lng, b.lat, b.lng)
 }
 
+/// Initial compass bearing from `a` to `b` in degrees clockwise from north, 0..360.
+pub fn bearing_deg(a: LngLat, b: LngLat) -> f64 {
+    let (_s12, azi1, _azi2, _a12): (f64, f64, f64, f64) =
+        Geodesic::wgs84().inverse(a.lat, a.lng, b.lat, b.lng);
+    azi1.rem_euclid(360.0)
+}
+
 pub fn path_length_m(pts: &[LngLat]) -> f64 {
     pts.windows(2).map(|w| distance_m(w[0], w[1])).sum()
 }
@@ -42,6 +49,30 @@ pub fn geodesic_circle(center: LngLat, radius_m: f64, segments: usize) -> Vec<Ln
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bearings_follow_the_compass() {
+        let o = LngLat::new(-92.0, 38.0);
+        assert!(
+            bearing_deg(o, LngLat::new(-92.0, 39.0)).abs() < 1e-6,
+            "north"
+        );
+        assert!(
+            (bearing_deg(o, LngLat::new(-91.0, 38.0)) - 90.0).abs() < 0.6,
+            "east"
+        );
+        assert!(
+            (bearing_deg(o, LngLat::new(-92.0, 37.0)) - 180.0).abs() < 1e-6,
+            "south"
+        );
+        assert!(
+            (bearing_deg(o, LngLat::new(-93.0, 38.0)) - 270.0).abs() < 0.6,
+            "west"
+        );
+        // Round trip through `destination`.
+        let d = destination(o, 123.0, 5000.0);
+        assert!((bearing_deg(o, d) - 123.0).abs() < 1e-6);
+    }
 
     #[test]
     fn known_distance_equator_degree() {

@@ -4,6 +4,7 @@
 
 use crate::earth_ui::EarthUi;
 use crate::ext_ui::ExtState;
+use crate::gps_ui::GpsState;
 use crate::layers::LayerStore;
 use crate::layers_ui::{ActiveDownload, DownloadUi, OverlayLayer};
 use crate::print_ui::PrintUi;
@@ -103,7 +104,7 @@ pub struct MapPanel {
     pub(crate) tiles: TileService,
     texture: Option<egui::TextureId>,
     failed: HashMap<TileKey, Instant>,
-    heights: HeightField,
+    pub(crate) heights: HeightField,
     velocity: Vec2,
     last_frame: Instant,
     coord_format: CoordFormat,
@@ -133,6 +134,9 @@ pub struct MapPanel {
     pub(crate) smf: SmfState,
     pub(crate) w3w: W3wState,
     pub(crate) ext: ExtState,
+    pub(crate) gps: GpsState,
+    /// Nearest vertex of the selected feature while navigating (set each frame for drawing).
+    pub(crate) gps_target: Option<(LngLat, String)>,
     pub(crate) earth: EarthUi,
     pub(crate) trails: TrailState,
     /// SMF_COND verification hook: query conditions here on the first frame.
@@ -211,6 +215,8 @@ impl MapPanel {
             smf: SmfState::new(&cc.egui_ctx),
             w3w: W3wState::new(),
             ext: ExtState::new(),
+            gps: GpsState::new(),
+            gps_target: None,
             earth: EarthUi::default(),
             trails: TrailState::new(),
             dev_conditions: None,
@@ -283,6 +289,7 @@ impl MapPanel {
         self.poll_smf(ui.ctx());
         self.poll_w3w(ui.ctx());
         self.poll_ext(ui.ctx());
+        self.poll_gps(ui.ctx());
         self.poll_trails(ui.ctx());
         self.trails_dev(editor);
         if let Some(ll) = self.dev_conditions.take() {
@@ -308,6 +315,7 @@ impl MapPanel {
                 ui.menu_button("Show Me Fire", |ui| self.smf_menu(ui, editor));
                 ui.menu_button("Layers", |ui| self.layers_menu(ui));
                 ui.menu_button("Fire & snow", |ui| self.ext_menu(ui));
+                ui.menu_button("GPS", |ui| self.gps_menu(ui, editor));
                 ui.menu_button("Offline", |ui| self.offline_menu(ui));
                 ui.menu_button("Shading", |ui| self.shading_menu(ui));
                 self.w3w_toolbar(ui, editor);
@@ -357,6 +365,7 @@ impl MapPanel {
             self.pending_fit = Some(b);
         }
 
+        let gps_text = self.gps_status_text(editor);
         // Vertical gain along the measured line, once its elevation tiles are loaded.
         let measure_gain = if editor.measure.len() >= 2 {
             let path = editor.measure.clone();
@@ -379,6 +388,16 @@ impl MapPanel {
         };
         egui::Panel::bottom("status").show(ui, |ui| {
             ui.horizontal(|ui| {
+                if let Some(t) = &gps_text {
+                    ui.label(
+                        egui::RichText::new(t)
+                            .strong()
+                            .color(Color32::from_rgb(90, 160, 255)),
+                    );
+                }
+                if gps_text.is_some() {
+                    ui.separator();
+                }
                 ui.label(tool_hint(editor));
                 if let Some(m) = overlay::measure_summary(editor) {
                     ui.separator();
@@ -526,6 +545,7 @@ impl MapPanel {
         };
         self.draw_smf_data(&painter, &pj, rect);
         self.draw_ext(&painter, &pj, rect);
+        self.draw_gps(&painter, &pj);
         self.draw_w3w(&painter, &pj, rect);
         overlay::draw_project(&painter, &pj, editor);
         let proj = self.proj();

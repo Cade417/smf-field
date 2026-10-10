@@ -3,7 +3,9 @@
 
 mod geodesy;
 mod view;
-pub use geodesy::{destination, distance_m, geodesic_circle, path_length_m, polygon_area_m2};
+pub use geodesy::{
+    bearing_deg, destination, distance_m, geodesic_circle, path_length_m, polygon_area_m2,
+};
 pub use view::{MapView, VisibleTile};
 
 use std::f64::consts::PI;
