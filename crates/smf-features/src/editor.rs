@@ -17,14 +17,26 @@ pub enum Tool {
 /// every property edit (name, style, vertices, radii) a single uniform command.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
-    Add { feature: Feature, index: usize },
-    Remove { feature: Feature, index: usize },
-    Replace { before: Feature, after: Feature },
+    Add {
+        feature: Feature,
+        index: usize,
+    },
+    Remove {
+        feature: Feature,
+        index: usize,
+    },
+    Replace {
+        before: Feature,
+        after: Feature,
+    },
+    /// Several commands undone/redone as one step (imports).
+    Batch(Vec<Command>),
 }
 
 impl Command {
     fn apply(&self, p: &mut Project) {
         match self {
+            Command::Batch(cmds) => cmds.iter().for_each(|c| c.apply(p)),
             Command::Add { feature, index } => {
                 let i = (*index).min(p.features.len());
                 p.features.insert(i, feature.clone());
@@ -40,6 +52,9 @@ impl Command {
 
     fn inverse(&self) -> Command {
         match self {
+            Command::Batch(cmds) => {
+                Command::Batch(cmds.iter().rev().map(Command::inverse).collect())
+            }
             Command::Add { feature, index } => Command::Remove {
                 feature: feature.clone(),
                 index: *index,
@@ -182,6 +197,22 @@ impl Editor {
         let index = self.project.features.len();
         self.run(Command::Add { feature, index });
         id
+    }
+
+    /// Add many features as a single undo step, assigning fresh ids. Returns the new ids.
+    pub fn add_features(&mut self, features: Vec<Feature>) -> Vec<Id> {
+        let mut ids = Vec::with_capacity(features.len());
+        let mut cmds = Vec::with_capacity(features.len());
+        for mut feature in features {
+            feature.id = self.project.alloc_id();
+            ids.push(feature.id);
+            let index = self.project.features.len() + cmds.len();
+            cmds.push(Command::Add { feature, index });
+        }
+        if !cmds.is_empty() {
+            self.run(Command::Batch(cmds));
+        }
+        ids
     }
 
     pub fn remove(&mut self, id: Id) {
@@ -486,6 +517,35 @@ mod tests {
         e.undo();
         assert_eq!(e.project.feature(id).unwrap().name, "Marker 1");
         assert!(e.can_undo(), "the add is still undoable separately");
+    }
+
+    #[test]
+    fn batch_add_is_one_undo_step_and_keeps_order() {
+        let mut e = Editor::default();
+        let mk = |n: &str| Feature {
+            id: 0,
+            name: n.into(),
+            geometry: Geometry::Marker(ll(0.0, 0.0)),
+            style: Style::default(),
+            folder: None,
+            visible: true,
+            notes: String::new(),
+        };
+        let ids = e.add_features(vec![mk("a"), mk("b"), mk("c")]);
+        assert_eq!(ids, vec![1, 2, 3]);
+        assert_eq!(
+            e.project
+                .features
+                .iter()
+                .map(|f| f.name.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b", "c"]
+        );
+        e.undo();
+        assert!(e.project.features.is_empty());
+        e.redo();
+        assert_eq!(e.project.features.len(), 3);
+        assert!(e.add_features(vec![]).is_empty());
     }
 
     #[test]

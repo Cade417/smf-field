@@ -10,6 +10,8 @@ pub enum IoError {
     Zip(#[from] zip::result::ZipError),
     #[error("project.json is invalid: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("{0}")]
+    Format(String),
     #[error("project was saved by a newer version (format {found}, this app reads up to {max})")]
     TooNew { found: u32, max: u32 },
 }

@@ -40,6 +40,8 @@ struct FieldApp {
     status: Option<(String, std::time::Instant)>,
     title: String,
     shot: Option<ScreenshotHook>,
+    /// Automated run: never open modal dialogs.
+    quiet: bool,
 }
 
 /// Dev/verification hook: with SMF_SCREENSHOT=<file.png> the app lets tiles load,
@@ -72,6 +74,7 @@ impl FieldApp {
             saved_revision: 0,
             status: None,
             title: String::new(),
+            quiet: shot.is_some() || std::env::var_os("SMF_IMPORT").is_some(),
             shot,
         };
         if let Some(p) = std::env::var_os("SMF_OPEN") {
@@ -84,7 +87,7 @@ impl FieldApp {
     }
 
     /// Verification hooks. SMF_CAM="lng,lat,distance_m,pitch_deg,heading_deg" starts in 3D at that
-    /// camera; SMF_SLOPE=deg|fire turns on slope shading; SMF_SELECT=<feature name> selects it.
+    /// camera; SMF_SLOPE=deg|fire turns on slope shading; SMF_SELECT=<feature name> selects it; SMF_IMPORT=a;b imports files at startup.
     fn apply_dev_env(&mut self) {
         if let Ok(v) = std::env::var("SMF_CAM") {
             let n: Vec<f64> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
@@ -103,6 +106,11 @@ impl FieldApp {
             for p in [&mut self.map.shade2d, &mut self.map.shade3d] {
                 p.slope = true;
                 p.slope_fire_preset = v == "fire";
+            }
+        }
+        if let Ok(list) = std::env::var("SMF_IMPORT") {
+            for path in list.split(';').filter(|p| !p.is_empty()) {
+                self.import_file(PathBuf::from(path));
             }
         }
         if let Ok(name) = std::env::var("SMF_SELECT") {
@@ -188,7 +196,9 @@ impl FieldApp {
     }
 
     fn confirm_discard(&self) -> bool {
+        // Automated runs have nobody to ask, and must not hang on a modal dialog.
         !self.dirty()
+            || self.quiet
             || rfd::MessageDialog::new()
                 .set_title("Unsaved changes")
                 .set_description("Discard unsaved changes to this map?")
@@ -232,10 +242,7 @@ impl FieldApp {
                 self.path = Some(p);
             }
             Err(e) => {
-                rfd::MessageDialog::new()
-                    .set_title("Could not open map")
-                    .set_description(e.to_string())
-                    .show();
+                alert(self.quiet, "Could not open map", e.to_string());
             }
         }
     }
@@ -268,10 +275,7 @@ impl FieldApp {
                 self.path = Some(path);
             }
             Err(e) => {
-                rfd::MessageDialog::new()
-                    .set_title("Could not save map")
-                    .set_description(e.to_string())
-                    .show();
+                alert(self.quiet, "Could not save map", e.to_string());
             }
         }
     }
@@ -294,6 +298,8 @@ impl FieldApp {
             let mut do_open = open;
             let mut do_save = plain_save;
             let mut do_save_as = save_as;
+            let mut do_import = false;
+            let mut do_export: Option<smf_io::Format> = None;
             egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("File", |ui| {
                     if ui.button("New        Ctrl+N").clicked() {
@@ -312,6 +318,19 @@ impl FieldApp {
                         do_save_as = true;
                         ui.close();
                     }
+                    ui.separator();
+                    if ui.button("Import…   (or drop files here)").clicked() {
+                        do_import = true;
+                        ui.close();
+                    }
+                    ui.menu_button("Export", |ui| {
+                        for fmt in smf_io::Format::ALL {
+                            if ui.button(fmt.label()).clicked() {
+                                do_export = Some(fmt);
+                                ui.close();
+                            }
+                        }
+                    });
                 });
                 ui.menu_button("Edit", |ui| {
                     if ui
@@ -362,12 +381,113 @@ impl FieldApp {
             if do_open {
                 self.open_dialog();
             }
+            if do_import {
+                self.import_dialog();
+            }
+            if let Some(fmt) = do_export {
+                self.export_dialog(fmt);
+            }
             if do_save_as {
                 self.save(true);
             } else if do_save {
                 self.save(false);
             }
         });
+    }
+
+    fn import_dialog(&mut self) {
+        let files = rfd::FileDialog::new()
+            .add_filter("Map data", smf_io::IMPORT_EXTENSIONS)
+            .pick_files();
+        for f in files.unwrap_or_default() {
+            self.import_file(f);
+        }
+    }
+
+    fn import_file(&mut self, path: PathBuf) {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        match smf_io::import_path(&path) {
+            Ok(imp) if imp.features.is_empty() => {
+                let mut msg = format!("{name} contained no features I can show.");
+                for w in &imp.warnings {
+                    msg.push_str(&format!(
+                        "
+- {w}"
+                    ));
+                }
+                alert(self.quiet, "Nothing imported", msg);
+            }
+            Ok(imp) => {
+                let warnings = imp.warnings.clone();
+                let ids = smf_io::apply_import(&mut self.editor, imp);
+                self.editor.selection = None;
+                if let Some(b) = bounds_of(&self.editor, &ids) {
+                    // Several files at once (drop/multi-select): frame them all, not just the last.
+                    self.map.pending_fit = Some(match self.map.pending_fit {
+                        Some(p) => [
+                            p[0].min(b[0]),
+                            p[1].min(b[1]),
+                            p[2].max(b[2]),
+                            p[3].max(b[3]),
+                        ],
+                        None => b,
+                    });
+                }
+                self.say(format!("Imported {} feature(s) from {name}", ids.len()));
+                if !warnings.is_empty() {
+                    notify_warnings(
+                        self.quiet,
+                        &format!("Imported {name} with notes"),
+                        &warnings,
+                    );
+                }
+            }
+            Err(e) => {
+                alert(self.quiet, "Could not import", format!("{name}: {e}"));
+            }
+        }
+    }
+
+    fn export_dialog(&mut self, fmt: smf_io::Format) {
+        let stem: String = self
+            .editor
+            .project
+            .name
+            .chars()
+            .map(|c| {
+                if c.is_alphanumeric() || matches!(c, ' ' | '-' | '_') {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let ext = fmt.extension();
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter(fmt.label(), &[ext])
+            .set_file_name(format!("{stem}.{ext}"))
+            .save_file()
+        else {
+            return;
+        };
+        match smf_io::export_path(&self.editor.project, &path, fmt) {
+            Ok(r) => {
+                self.say(format!(
+                    "Exported {} file(s) as {}",
+                    r.files.len(),
+                    fmt.label()
+                ));
+                if !r.warnings.is_empty() {
+                    notify_warnings(self.quiet, "Exported with notes", &r.warnings);
+                }
+            }
+            Err(e) => {
+                alert(self.quiet, "Could not export", e.to_string());
+            }
+        }
     }
 
     fn update_title(&mut self, ctx: &egui::Context) {
@@ -394,6 +514,16 @@ impl eframe::App for FieldApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
         self.update_title(&ctx);
+        let dropped: Vec<PathBuf> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .map(|f| f.path().to_path_buf())
+                .collect()
+        });
+        for p in dropped {
+            self.import_file(p);
+        }
         self.menu(ui);
         self.map.show(ui, &mut self.editor);
         self.screenshot_hook(&ctx);
@@ -427,5 +557,60 @@ impl FieldApp {
         } else {
             ctx.request_repaint_after(std::time::Duration::from_millis(250));
         }
+    }
+}
+
+/// Bounding box (min_lng, min_lat, max_lng, max_lat) of the given features, padded so a single point isn't zoomed to max.
+fn bounds_of(editor: &Editor, ids: &[u64]) -> Option<[f64; 4]> {
+    let mut b: Option<[f64; 4]> = None;
+    for id in ids {
+        for p in editor.project.feature(*id)?.geometry.vertices() {
+            let e = b.get_or_insert([p.lng, p.lat, p.lng, p.lat]);
+            *e = [
+                e[0].min(p.lng),
+                e[1].min(p.lat),
+                e[2].max(p.lng),
+                e[3].max(p.lat),
+            ];
+        }
+    }
+    b.map(|b| {
+        if (b[2] - b[0]).abs() < 1e-5 && (b[3] - b[1]).abs() < 1e-5 {
+            [b[0] - 0.005, b[1] - 0.005, b[2] + 0.005, b[3] + 0.005]
+        } else {
+            b
+        }
+    })
+}
+
+fn notify_warnings(quiet: bool, title: &str, warnings: &[String]) {
+    let mut msg = String::new();
+    for w in warnings.iter().take(12) {
+        msg.push_str(&format!(
+            "- {w}
+"
+        ));
+    }
+    if warnings.len() > 12 {
+        msg.push_str(&format!(
+            "...and {} more
+",
+            warnings.len() - 12
+        ));
+    }
+    alert(quiet, title, msg);
+}
+
+/// Modal message box, except in automated runs (SMF_SCREENSHOT / SMF_IMPORT) where it would block
+/// forever: there the message goes to the log instead.
+fn alert(quiet: bool, title: &str, msg: impl Into<String>) {
+    let msg = msg.into();
+    if quiet {
+        tracing::warn!("{title}: {msg}");
+    } else {
+        rfd::MessageDialog::new()
+            .set_title(title)
+            .set_description(msg)
+            .show();
     }
 }
