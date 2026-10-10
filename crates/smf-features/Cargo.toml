@@ -9,3 +9,5 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+smf-geo.workspace = true
+serde.workspace = true

@@ -1,7 +1,9 @@
 //! Pure geographic math: Web Mercator, slippy-map tiles, coordinate formatting.
 //! No IO and no GPU so it stays WASM-friendly and trivially testable.
 
+mod geodesy;
 mod view;
+pub use geodesy::{destination, distance_m, geodesic_circle, path_length_m, polygon_area_m2};
 pub use view::{MapView, VisibleTile};
 
 use std::f64::consts::PI;
@@ -12,7 +14,7 @@ pub const TILE_SIZE: f64 = 256.0;
 /// Equatorial circumference in metres (EPSG:3857).
 pub const EARTH_CIRCUMFERENCE_M: f64 = 40_075_016.685_578_49;
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LngLat {
     pub lng: f64,
     pub lat: f64,
@@ -115,6 +117,31 @@ pub fn format_utm(p: LngLat) -> Option<String> {
     Some(format!("{zone}{band} {e:.0}E {n:.0}N"))
 }
 
+/// "850 m (2789 ft)" / "12.40 km (7.70 mi)" so both unit systems field crews use are visible.
+pub fn format_distance(m: f64) -> String {
+    let metric = if m >= 1000.0 {
+        format!("{:.2} km", m / 1000.0)
+    } else {
+        format!("{m:.0} m")
+    };
+    let ft = m * 3.280_839_895;
+    let imperial = if ft >= 5280.0 {
+        format!("{:.2} mi", ft / 5280.0)
+    } else {
+        format!("{ft:.0} ft")
+    };
+    format!("{metric} ({imperial})")
+}
+
+/// Area in hectares/acres, switching to km2/mi2 for large areas.
+pub fn format_area(m2: f64) -> String {
+    if m2 >= 1_000_000.0 {
+        format!("{:.2} km² ({:.2} mi²)", m2 / 1e6, m2 / 2_589_988.110_336)
+    } else {
+        format!("{:.2} ha ({:.2} ac)", m2 / 10_000.0, m2 / 4_046.856_422_4)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,6 +179,14 @@ mod tests {
     #[test]
     fn meters_per_pixel_z0_equator() {
         assert!((meters_per_pixel(0.0, 0.0) - 156_543.03).abs() < 0.01);
+    }
+
+    #[test]
+    fn unit_formats() {
+        assert_eq!(format_distance(850.0), "850 m (2789 ft)");
+        assert_eq!(format_distance(12_000.0), "12.00 km (7.46 mi)");
+        assert_eq!(format_area(10_000.0), "1.00 ha (2.47 ac)");
+        assert_eq!(format_area(2_589_988.110_336), "2.59 km² (1.00 mi²)");
     }
 
     #[test]
