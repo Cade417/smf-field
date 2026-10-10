@@ -7,16 +7,18 @@ use smf_geo::{
     EARTH_CIRCUMFERENCE_M, MapView, TILE_SIZE, TileId, lnglat_to_mercator, mercator_to_lnglat,
     world_to_lnglat,
 };
-use smf_render::{MapRenderer, ShadeParams, TileKey, plan_frame_at};
+use smf_render::{MapRenderer, PendingRead, ShadeParams, TileKey, plan_frame_at};
 use smf_terrain::decode_terrarium;
 use smf_tiles::{TileEvent, TileService, TileSource};
 use std::collections::HashSet;
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use web_time::Instant;
 
 /// Refuse outputs beyond this many pixels (an A2 at 600 dpi is ~140 MP; 100 MP is plenty).
 pub const MAX_PIXELS: u64 = 100_000_000;
@@ -37,6 +39,7 @@ pub enum PrintError {
     Io(String),
 }
 
+#[derive(Clone)]
 pub struct RenderLayers {
     pub base: Arc<TileSource>,
     /// (source, opacity) drawn on top of the basemap, in order.
@@ -67,22 +70,26 @@ impl Rendered {
     }
 }
 
-struct Ingest<'a> {
-    svc: &'a TileService,
-    sources: Vec<Arc<TileSource>>,
+/// Tiles that arrived or failed for this render, tracked across steps.
+struct Ingest {
     terrain_id: Option<String>,
     failed: HashSet<TileKey>,
     failed_heights: HashSet<TileId>,
 }
 
-impl Ingest<'_> {
-    fn drain(&mut self, renderer: &mut MapRenderer) {
-        while let Some(ev) = self.svc.try_recv() {
+impl Ingest {
+    fn drain(
+        &mut self,
+        svc: &TileService,
+        sources: &[Arc<TileSource>],
+        renderer: &mut MapRenderer,
+    ) {
+        while let Some(ev) = svc.try_recv() {
             match ev {
                 TileEvent::Ready { source, id, rgba } => {
                     if self.terrain_id.as_deref() == Some(&source) {
                         renderer.upload_height(id, &decode_terrarium(&rgba).heights);
-                    } else if let Some(i) = self.sources.iter().position(|s| s.id == source) {
+                    } else if let Some(i) = sources.iter().position(|s| s.id == source) {
                         renderer.upload_tile(
                             TileKey {
                                 source: i as u16,
@@ -95,7 +102,7 @@ impl Ingest<'_> {
                 TileEvent::Failed { source, id } => {
                     if self.terrain_id.as_deref() == Some(&source) {
                         self.failed_heights.insert(id);
-                    } else if let Some(i) = self.sources.iter().position(|s| s.id == source) {
+                    } else if let Some(i) = sources.iter().position(|s| s.id == source) {
                         self.failed.insert(TileKey {
                             source: i as u16,
                             id,
@@ -107,7 +114,261 @@ impl Ingest<'_> {
     }
 }
 
-/// Render `view` (any size) to RGBA. `progress` receives 0..1.
+/// One step of a resumable job: still working (with progress 0..1), or finished.
+pub enum Step<T> {
+    Pending(f32),
+    Done(Result<T, PrintError>),
+}
+
+enum Phase {
+    /// Waiting for the chunk's tiles to arrive.
+    Loading,
+    /// The chunk is drawn; its pixels are being copied back from the GPU.
+    Reading {
+        read: PendingRead,
+        x0: u32,
+        y0: u32,
+        cw: u32,
+        ch: u32,
+    },
+}
+
+/// Renders a map region in chunks without ever blocking: call `step` repeatedly (every frame in
+/// a browser, in a loop with a short sleep on the desktop) until it returns `Done`.
+pub struct RegionJob {
+    layers: RenderLayers,
+    sources: Vec<Arc<TileSource>>,
+    ing: Ingest,
+    shading: bool,
+    per_chunk_timeout: Duration,
+    w: u32,
+    h: u32,
+    cols: u32,
+    rows: u32,
+    cwx: f64,
+    cwy: f64,
+    zoom: f64,
+    out: Vec<u8>,
+    missing: usize,
+    chunk: u32,
+    started: Instant,
+    sub: Option<MapView>,
+    tzs: Vec<u8>,
+    phase: Phase,
+}
+
+impl RegionJob {
+    pub fn new(
+        svc: &TileService,
+        view: &MapView,
+        layers: RenderLayers,
+        per_chunk_timeout: Duration,
+    ) -> Result<Self, PrintError> {
+        let (w, h) = (view.size[0].round() as u32, view.size[1].round() as u32);
+        let pixels = w as u64 * h as u64;
+        if w == 0 || h == 0 {
+            return Err(PrintError::Render("the output area is empty".into()));
+        }
+        if pixels > MAX_PIXELS {
+            return Err(PrintError::TooLarge {
+                pixels,
+                limit: MAX_PIXELS,
+            });
+        }
+        let mut sources = vec![layers.base.clone()];
+        sources.extend(layers.overlays.iter().map(|(s, _)| s.clone()));
+        for s in &sources {
+            svc.register_source(s).map_err(PrintError::Render)?;
+        }
+        let shading = layers.terrain.is_some() && (layers.shade.hillshade || layers.shade.slope);
+        // View centre in world pixels at the print zoom, to offset each chunk from.
+        let (cwx, cwy) = smf_geo::lnglat_to_world(view.center, view.zoom);
+        Ok(Self {
+            ing: Ingest {
+                terrain_id: layers.terrain.as_ref().map(|t| t.id.clone()),
+                failed: HashSet::new(),
+                failed_heights: HashSet::new(),
+            },
+            layers,
+            sources,
+            shading,
+            per_chunk_timeout,
+            w,
+            h,
+            cols: w.div_ceil(CHUNK),
+            rows: h.div_ceil(CHUNK),
+            cwx,
+            cwy,
+            zoom: view.zoom,
+            out: vec![0u8; (w * h * 4) as usize],
+            missing: 0,
+            chunk: 0,
+            started: Instant::now(),
+            sub: None,
+            tzs: vec![],
+            phase: Phase::Loading,
+        })
+    }
+
+    fn progress(&self) -> f32 {
+        self.chunk as f32 / (self.cols * self.rows) as f32
+    }
+
+    /// Rectangle of the current chunk: (x0, y0, width, height).
+    fn chunk_rect(&self) -> (u32, u32, u32, u32) {
+        let (rx, ry) = (self.chunk % self.cols, self.chunk / self.cols);
+        let (x0, y0) = (rx * CHUNK, ry * CHUNK);
+        (x0, y0, (self.w - x0).min(CHUNK), (self.h - y0).min(CHUNK))
+    }
+
+    pub fn step(
+        &mut self,
+        renderer: &mut MapRenderer,
+        svc: &TileService,
+        cancel: &AtomicBool,
+    ) -> Step<Rendered> {
+        if cancel.load(Ordering::Relaxed) {
+            return Step::Done(Err(PrintError::Cancelled));
+        }
+        match &self.phase {
+            Phase::Reading { .. } => self.step_read(renderer),
+            Phase::Loading => self.step_load(renderer, svc),
+        }
+    }
+
+    fn step_read(&mut self, renderer: &MapRenderer) -> Step<Rendered> {
+        let Phase::Reading {
+            read,
+            x0,
+            y0,
+            cw,
+            ch,
+        } = &self.phase
+        else {
+            return Step::Pending(self.progress());
+        };
+        let (x0, y0, cw, ch) = (*x0, *y0, *cw, *ch);
+        let px = match read.poll(renderer.device()) {
+            None => return Step::Pending(self.progress()),
+            Some(None) => {
+                return Step::Done(Err(PrintError::Render("GPU readback failed".into())));
+            }
+            Some(Some(px)) => px,
+        };
+        for row in 0..ch {
+            let src = (row * cw * 4) as usize;
+            let dst = (((y0 + row) * self.w + x0) * 4) as usize;
+            self.out[dst..dst + (cw * 4) as usize]
+                .copy_from_slice(&px[src..src + (cw * 4) as usize]);
+        }
+        self.chunk += 1;
+        self.phase = Phase::Loading;
+        self.sub = None;
+        if self.chunk == self.cols * self.rows {
+            return Step::Done(Ok(Rendered {
+                width: self.w,
+                height: self.h,
+                rgba: std::mem::take(&mut self.out),
+                missing_tiles: self.missing,
+            }));
+        }
+        Step::Pending(self.progress())
+    }
+
+    fn step_load(&mut self, renderer: &mut MapRenderer, svc: &TileService) -> Step<Rendered> {
+        let (x0, y0, cw, ch) = self.chunk_rect();
+        if self.sub.is_none() {
+            // Chunk centre in world pixels: view centre plus the chunk's offset from the view centre.
+            let ccx = self.cwx + (x0 as f64 + cw as f64 / 2.0 - self.w as f64 / 2.0);
+            let ccy = self.cwy + (y0 as f64 + ch as f64 / 2.0 - self.h as f64 / 2.0);
+            self.sub = Some(MapView::new(
+                world_to_lnglat(ccx, ccy, self.zoom),
+                self.zoom,
+                [cw as f64, ch as f64],
+            ));
+            renderer.ensure_target([cw, ch]);
+            self.started = Instant::now();
+        }
+        let Some(sub) = self.sub else {
+            return Step::Pending(self.progress());
+        };
+        // Print tiles one zoom level finer than the nominal one: sharper, never stretched.
+        let zoom = self.zoom;
+        let tz_for = move |max_zoom: u8| (zoom.ceil().max(0.0) as u8).min(max_zoom);
+
+        svc.begin_frame();
+        renderer.begin_frame();
+        self.ing.drain(svc, &self.sources, renderer);
+        let mut reqs: Vec<(usize, TileKey, f32)> = vec![];
+        self.tzs.clear();
+        let base_tz = tz_for(self.layers.base.max_zoom);
+        self.tzs.push(base_tz);
+        let plan = plan_frame_at(renderer, &sub, 0, base_tz, 1.0);
+        let mut quads = plan.quads;
+        reqs.extend(plan.requests.into_iter().map(|(k, p)| (0usize, k, p)));
+        for (i, (src, opacity)) in self.layers.overlays.iter().enumerate() {
+            let otz = tz_for(src.max_zoom);
+            self.tzs.push(otz);
+            let p = plan_frame_at(renderer, &sub, (i + 1) as u16, otz, *opacity);
+            quads.extend(p.quads);
+            reqs.extend(p.requests.into_iter().map(|(k, pr)| (i + 1, k, pr)));
+        }
+        let mut hreqs: Vec<(TileId, f32)> = vec![];
+        let mut shade_verts = vec![];
+        if self.shading {
+            let (v, hr) = renderer.plan_shade(&sub, base_tz.min(15));
+            shade_verts = v;
+            hreqs = hr
+                .into_iter()
+                .map(|(k, p)| (k.id, p))
+                .filter(|(id, _)| !self.ing.failed_heights.contains(id))
+                .collect();
+        }
+        let pending: Vec<_> = reqs
+            .iter()
+            .filter(|(_, k, _)| !self.ing.failed.contains(k))
+            .collect();
+        let timed_out = self.started.elapsed() > self.per_chunk_timeout;
+        if !((pending.is_empty() && hreqs.is_empty()) || timed_out) {
+            for (i, k, p) in &pending {
+                svc.request(&self.sources[*i], k.id, *p);
+            }
+            if let Some(t) = &self.layers.terrain {
+                for (id, p) in &hreqs {
+                    svc.request(t, *id, *p);
+                }
+            }
+            return Step::Pending(self.progress());
+        }
+        // Missing = tiles of the final zoom this chunk needed but never got (failed or timed out).
+        // Ancestors requested only as fallbacks are not counted.
+        self.missing += reqs
+            .iter()
+            .filter(|(i, k, _)| k.id.z == self.tzs[*i])
+            .count();
+        renderer.render_2d(
+            &quads,
+            &shade_verts,
+            &self.layers.shade_for_render(self.shading),
+        );
+        match renderer.begin_read() {
+            Some(read) => {
+                self.phase = Phase::Reading {
+                    read,
+                    x0,
+                    y0,
+                    cw,
+                    ch,
+                };
+                Step::Pending(self.progress())
+            }
+            None => Step::Done(Err(PrintError::Render("GPU readback failed".into()))),
+        }
+    }
+}
+
+/// Render `view` (any size) to RGBA, blocking until done (desktop). `progress` receives 0..1.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn render_region(
     renderer: &mut MapRenderer,
     svc: &TileService,
@@ -117,132 +378,16 @@ pub fn render_region(
     cancel: &AtomicBool,
     per_chunk_timeout: Duration,
 ) -> Result<Rendered, PrintError> {
-    let (w, h) = (view.size[0].round() as u32, view.size[1].round() as u32);
-    let pixels = w as u64 * h as u64;
-    if w == 0 || h == 0 {
-        return Err(PrintError::Render("the output area is empty".into()));
-    }
-    if pixels > MAX_PIXELS {
-        return Err(PrintError::TooLarge {
-            pixels,
-            limit: MAX_PIXELS,
-        });
-    }
-    let mut sources = vec![layers.base.clone()];
-    sources.extend(layers.overlays.iter().map(|(s, _)| s.clone()));
-    for s in &sources {
-        svc.register_source(s).map_err(PrintError::Render)?;
-    }
-    let shading = layers.terrain.is_some() && (layers.shade.hillshade || layers.shade.slope);
-    let mut ing = Ingest {
-        svc,
-        sources: sources.clone(),
-        terrain_id: layers.terrain.as_ref().map(|t| t.id.clone()),
-        failed: HashSet::new(),
-        failed_heights: HashSet::new(),
-    };
-    let mut out = vec![0u8; (w * h * 4) as usize];
-    let mut missing = 0usize;
-    let (cols, rows) = (w.div_ceil(CHUNK), h.div_ceil(CHUNK));
-    let total = (cols * rows) as f32;
-    // View centre in world pixels at the print zoom, to offset each chunk from.
-    let (cwx, cwy) = smf_geo::lnglat_to_world(view.center, view.zoom);
-    // Print tiles one zoom level finer than the nominal one: sharper, never stretched.
-    let tz_for = |max_zoom: u8| (view.zoom.ceil().max(0.0) as u8).min(max_zoom);
-
-    for ry in 0..rows {
-        for rx in 0..cols {
-            let (x0, y0) = (rx * CHUNK, ry * CHUNK);
-            let (cw, ch) = ((w - x0).min(CHUNK), (h - y0).min(CHUNK));
-            // Chunk centre in world pixels: view centre plus the chunk's offset from the view centre.
-            let ccx = cwx + (x0 as f64 + cw as f64 / 2.0 - w as f64 / 2.0);
-            let ccy = cwy + (y0 as f64 + ch as f64 / 2.0 - h as f64 / 2.0);
-            let sub = MapView::new(
-                world_to_lnglat(ccx, ccy, view.zoom),
-                view.zoom,
-                [cw as f64, ch as f64],
-            );
-            renderer.ensure_target([cw, ch]);
-
-            let started = Instant::now();
-            let (mut quads, mut shade_verts);
-            // Zoom each source's tiles are drawn at, to tell exact tiles from fallback ancestors.
-            let mut tzs: Vec<u8> = vec![];
-            let mut reqs: Vec<(usize, TileKey, f32)>;
-            loop {
-                if cancel.load(Ordering::Relaxed) {
-                    return Err(PrintError::Cancelled);
-                }
-                svc.begin_frame();
-                renderer.begin_frame();
-                ing.drain(renderer);
-                reqs = vec![];
-                tzs.clear();
-                let base_tz = tz_for(layers.base.max_zoom);
-                tzs.push(base_tz);
-                let plan = plan_frame_at(renderer, &sub, 0, base_tz, 1.0);
-                quads = plan.quads;
-                reqs.extend(plan.requests.into_iter().map(|(k, p)| (0usize, k, p)));
-                for (i, (src, opacity)) in layers.overlays.iter().enumerate() {
-                    let otz = tz_for(src.max_zoom);
-                    tzs.push(otz);
-                    let p = plan_frame_at(renderer, &sub, (i + 1) as u16, otz, *opacity);
-                    quads.extend(p.quads);
-                    reqs.extend(p.requests.into_iter().map(|(k, pr)| (i + 1, k, pr)));
-                }
-                let mut hreqs: Vec<(TileId, f32)> = vec![];
-                shade_verts = vec![];
-                if shading {
-                    let (v, hr) = renderer.plan_shade(&sub, base_tz.min(15));
-                    shade_verts = v;
-                    hreqs = hr
-                        .into_iter()
-                        .map(|(k, p)| (k.id, p))
-                        .filter(|(id, _)| !ing.failed_heights.contains(id))
-                        .collect();
-                }
-                let pending: Vec<_> = reqs
-                    .iter()
-                    .filter(|(_, k, _)| !ing.failed.contains(k))
-                    .collect();
-                if pending.is_empty() && hreqs.is_empty() {
-                    break;
-                }
-                for (i, k, p) in &pending {
-                    svc.request(&sources[*i], k.id, *p);
-                }
-                if let Some(t) = &layers.terrain {
-                    for (id, p) in &hreqs {
-                        svc.request(t, *id, *p);
-                    }
-                }
-                if started.elapsed() > per_chunk_timeout {
-                    break;
-                }
+    let mut job = RegionJob::new(svc, view, layers.clone(), per_chunk_timeout)?;
+    loop {
+        match job.step(renderer, svc, cancel) {
+            Step::Pending(p) => {
+                progress(p);
                 std::thread::sleep(Duration::from_millis(4));
             }
-            // Missing = tiles of the final zoom this chunk needed but never got (failed or timed out).
-            // Ancestors requested only as fallbacks are not counted.
-            missing += reqs.iter().filter(|(i, k, _)| k.id.z == tzs[*i]).count();
-            renderer.render_2d(&quads, &shade_verts, &layers.shade_for_render(shading));
-            let px = renderer
-                .read_pixels()
-                .ok_or_else(|| PrintError::Render("GPU readback failed".into()))?;
-            for row in 0..ch {
-                let src = (row * cw * 4) as usize;
-                let dst = (((y0 + row) * w + x0) * 4) as usize;
-                out[dst..dst + (cw * 4) as usize]
-                    .copy_from_slice(&px[src..src + (cw * 4) as usize]);
-            }
-            progress((ry * cols + rx + 1) as f32 / total);
+            Step::Done(r) => return r,
         }
     }
-    Ok(Rendered {
-        width: w,
-        height: h,
-        rgba: out,
-        missing_tiles: missing,
-    })
 }
 
 impl RenderLayers {
@@ -315,8 +460,8 @@ impl GeoTiffRegion {
     }
 }
 
-/// Write an RGB GeoTIFF in EPSG:3857 (alpha is dropped: the render is opaque).
-pub fn write_geotiff(path: &Path, r: &Rendered, region: &GeoTiffRegion) -> Result<(), PrintError> {
+/// Encode an RGB GeoTIFF in EPSG:3857 (alpha is dropped: the render is opaque).
+pub fn geotiff_bytes(r: &Rendered, region: &GeoTiffRegion) -> Result<Vec<u8>, PrintError> {
     use tiff::encoder::{TiffEncoder, colortype};
     use tiff::tags::Tag;
     let io = |e: &dyn std::fmt::Display| PrintError::Io(e.to_string());
@@ -325,11 +470,9 @@ pub fn write_geotiff(path: &Path, r: &Rendered, region: &GeoTiffRegion) -> Resul
         .chunks_exact(4)
         .flat_map(|p| [p[0], p[1], p[2]])
         .collect();
-    let tmp = path.with_extension("tif.tmp");
+    let mut buf = std::io::Cursor::new(Vec::new());
     {
-        let mut f = std::fs::File::create(&tmp).map_err(|e| io(&e))?;
-        // BigTIFF only when needed: classic TIFF tops out at 4 GB.
-        let mut enc = TiffEncoder::new(&mut f).map_err(|e| io(&e))?;
+        let mut enc = TiffEncoder::new(&mut buf).map_err(|e| io(&e))?;
         let mut img = enc
             .new_image::<colortype::RGB8>(r.width, r.height)
             .map_err(|e| io(&e))?;
@@ -353,13 +496,23 @@ pub fn write_geotiff(path: &Path, r: &Rendered, region: &GeoTiffRegion) -> Resul
             .map_err(|e| io(&e))?;
         img.write_data(&rgb).map_err(|e| io(&e))?;
     }
+    Ok(buf.into_inner())
+}
+
+/// Write an RGB GeoTIFF file (desktop): written beside the target and renamed into place.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn write_geotiff(path: &Path, r: &Rendered, region: &GeoTiffRegion) -> Result<(), PrintError> {
+    let io = |e: &dyn std::fmt::Display| PrintError::Io(e.to_string());
+    let bytes = geotiff_bytes(r, region)?;
+    let tmp = path.with_extension("tif.tmp");
+    std::fs::write(&tmp, bytes).map_err(|e| io(&e))?;
     std::fs::rename(&tmp, path).map_err(|e| io(&e))
 }
 
 /// Today's date (UTC) as YYYY-MM-DD without pulling in a date crate.
 pub fn utc_date() -> String {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    let secs = web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
     civil_date(secs as i64 / 86_400)

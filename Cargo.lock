@@ -4258,6 +4258,8 @@ version = "0.1.0"
 dependencies = [
  "serde_json",
  "serialport",
+ "wasm-bindgen",
+ "web-sys",
  "windows",
 ]
 
@@ -4310,6 +4312,7 @@ dependencies = [
  "tiff",
  "tracing",
  "utm",
+ "web-time",
 ]
 
 [[package]]

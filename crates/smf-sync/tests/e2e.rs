@@ -209,11 +209,14 @@ fn two_clients_converge_through_a_real_server() {
         speed: Some(1.4),
         ..Position::default()
     }));
+    // Sessions are tick-driven, so Bob must be ticked for his report to go out.
+    bob.pump(3, |_| false);
     alice.pump(15, |p| !p.positions.is_empty());
     assert_eq!(alice.positions.len(), 1);
     assert_eq!(alice.positions[0].display_name, "Bob");
     assert_eq!(alice.positions[0].speed, Some(1.4));
     bob.handle.send(Command::ClearPosition);
+    bob.pump(3, |_| false);
     alice.pump(15, |p| p.positions.is_empty());
     assert!(alice.positions.is_empty(), "Bob stopped sharing");
 

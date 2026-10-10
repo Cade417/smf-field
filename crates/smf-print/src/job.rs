@@ -3,13 +3,13 @@
 use crate::compose::{LegendOverlay, compose_pdf};
 use crate::layout::{Layout, PrintProjection, PrintSpec};
 use crate::raster::{
-    GeoTiffRegion, PrintError, RenderLayers, encode_jpeg, render_region, utc_date, write_geotiff,
+    GeoTiffRegion, PrintError, RegionJob, RenderLayers, Rendered, Step, encode_jpeg, geotiff_bytes,
+    utc_date,
 };
 use smf_features::Project;
 use smf_geo::{LngLat, distance_m};
 use smf_render::MapRenderer;
 use smf_tiles::TileService;
-use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
@@ -66,6 +66,127 @@ pub struct PdfOutput {
     pub missing_tiles: usize,
 }
 
+/// A PDF print as a resumable task: call `step` repeatedly (every frame in a browser) until it
+/// returns `Done`. Rendering the map is about 90% of the work; JPEG encoding and composing the
+/// page happen in the final step.
+pub struct PdfTask {
+    region: RegionJob,
+    spec: PrintSpec,
+    base_attribution: String,
+    project: Project,
+    extra: Vec<smf_features::Feature>,
+    legend: Vec<LegendOverlay>,
+}
+
+impl PdfTask {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        svc: &TileService,
+        spec: &PrintSpec,
+        layers: &RenderLayers,
+        project: &Project,
+        // Drawn on the map (beneath the project's markup) but not listed individually in the legend.
+        extra_features: &[smf_features::Feature],
+        legend_overlays: &[LegendOverlay],
+    ) -> Result<Self, PrintError> {
+        let layout = Layout::new(spec).map_err(|e| PrintError::Render(e.to_string()))?;
+        let pj = PrintProjection::new(spec, &layout);
+        let region = RegionJob::new(svc, &pj.map_view(), layers.clone(), Duration::from_secs(90))?;
+        Ok(Self {
+            region,
+            spec: spec.clone(),
+            base_attribution: layers.base.attribution.clone(),
+            project: project.clone(),
+            extra: extra_features.to_vec(),
+            legend: legend_overlays.to_vec(),
+        })
+    }
+
+    pub fn step(
+        &mut self,
+        renderer: &mut MapRenderer,
+        svc: &TileService,
+        cancel: &AtomicBool,
+    ) -> Step<PdfOutput> {
+        match self.region.step(renderer, svc, cancel) {
+            Step::Pending(p) => Step::Pending(p * 0.9),
+            Step::Done(Err(e)) => Step::Done(Err(e)),
+            Step::Done(Ok(rendered)) => Step::Done(self.finish(rendered)),
+        }
+    }
+
+    fn finish(&mut self, rendered: Rendered) -> Result<PdfOutput, PrintError> {
+        let jpeg = encode_jpeg(&rendered, 90)?;
+        let mut spec = self.spec.clone();
+        if spec.attribution.is_empty() {
+            spec.attribution = self.base_attribution.clone();
+        }
+        let composed = compose_pdf(
+            &spec,
+            jpeg,
+            [rendered.width, rendered.height],
+            &self.project,
+            &self.extra,
+            &self.legend,
+            &utc_date(),
+        )
+        .map_err(|e| PrintError::Render(e.to_string()))?;
+        let mut warnings = composed.warnings;
+        if rendered.missing_tiles > 0 {
+            warnings.push(format!(
+                "{} map tile(s) could not be loaded; those areas show lower-resolution imagery.",
+                rendered.missing_tiles
+            ));
+        }
+        Ok(PdfOutput {
+            bytes: composed.bytes,
+            warnings,
+            missing_tiles: rendered.missing_tiles,
+        })
+    }
+}
+
+/// A GeoTIFF export as a resumable task; finishes with the file bytes and the missing-tile count.
+pub struct GeoTiffTask {
+    region: RegionJob,
+    geo: GeoTiffRegion,
+}
+
+impl GeoTiffTask {
+    pub fn new(
+        svc: &TileService,
+        bounds: [f64; 4],
+        zoom: u8,
+        layers: &RenderLayers,
+    ) -> Result<Self, PrintError> {
+        let geo = GeoTiffRegion::new(bounds, zoom);
+        let region = RegionJob::new(
+            svc,
+            &geo.map_view(),
+            layers.clone(),
+            Duration::from_secs(90),
+        )?;
+        Ok(Self { region, geo })
+    }
+
+    pub fn step(
+        &mut self,
+        renderer: &mut MapRenderer,
+        svc: &TileService,
+        cancel: &AtomicBool,
+    ) -> Step<(Vec<u8>, usize)> {
+        match self.region.step(renderer, svc, cancel) {
+            Step::Pending(p) => Step::Pending(p),
+            Step::Done(Err(e)) => Step::Done(Err(e)),
+            Step::Done(Ok(r)) => {
+                Step::Done(geotiff_bytes(&r, &self.geo).map(|b| (b, r.missing_tiles)))
+            }
+        }
+    }
+}
+
+/// Render and compose a PDF, blocking until done (desktop).
+#[cfg(not(target_arch = "wasm32"))]
 #[allow(clippy::too_many_arguments)]
 pub fn print_to_pdf(
     renderer: &mut MapRenderer,
@@ -79,73 +200,54 @@ pub fn print_to_pdf(
     progress: &mut dyn FnMut(f32),
     cancel: &AtomicBool,
 ) -> Result<PdfOutput, PrintError> {
-    let layout = Layout::new(spec).map_err(|e| PrintError::Render(e.to_string()))?;
-    let pj = PrintProjection::new(spec, &layout);
-    // Render takes ~90% of the work; leave the rest for JPEG encoding and composing.
-    let mut scaled = |p: f32| progress(p * 0.9);
-    let rendered = render_region(
-        renderer,
-        svc,
-        &pj.map_view(),
-        layers,
-        &mut scaled,
-        cancel,
-        Duration::from_secs(90),
-    )?;
-    let jpeg = encode_jpeg(&rendered, 90)?;
-    let mut spec = spec.clone();
-    if spec.attribution.is_empty() {
-        spec.attribution = layers.base.attribution.clone();
+    let mut task = PdfTask::new(svc, spec, layers, project, extra_features, legend_overlays)?;
+    loop {
+        match task.step(renderer, svc, cancel) {
+            Step::Pending(p) => {
+                progress(p);
+                std::thread::sleep(Duration::from_millis(4));
+            }
+            Step::Done(r) => {
+                if r.is_ok() {
+                    progress(1.0);
+                }
+                return r;
+            }
+        }
     }
-    let composed = compose_pdf(
-        &spec,
-        jpeg,
-        [rendered.width, rendered.height],
-        project,
-        extra_features,
-        legend_overlays,
-        &utc_date(),
-    )
-    .map_err(|e| PrintError::Render(e.to_string()))?;
-    let mut warnings = composed.warnings;
-    if rendered.missing_tiles > 0 {
-        warnings.push(format!(
-            "{} map tile(s) could not be loaded; those areas show lower-resolution imagery.",
-            rendered.missing_tiles
-        ));
-    }
-    progress(1.0);
-    Ok(PdfOutput {
-        bytes: composed.bytes,
-        warnings,
-        missing_tiles: rendered.missing_tiles,
-    })
 }
 
+/// Render `bounds` at integer `zoom` and write an EPSG:3857 GeoTIFF (desktop). Returns the
+/// missing-tile count.
+#[cfg(not(target_arch = "wasm32"))]
 #[allow(clippy::too_many_arguments)]
-/// Render `bounds` at integer `zoom` and write an EPSG:3857 GeoTIFF. Returns the missing-tile count.
 pub fn export_geotiff(
     renderer: &mut MapRenderer,
     svc: &TileService,
     bounds: [f64; 4],
     zoom: u8,
     layers: &RenderLayers,
-    path: &Path,
+    path: &std::path::Path,
     progress: &mut dyn FnMut(f32),
     cancel: &AtomicBool,
 ) -> Result<usize, PrintError> {
-    let region = GeoTiffRegion::new(bounds, zoom);
-    let rendered = render_region(
-        renderer,
-        svc,
-        &region.map_view(),
-        layers,
-        progress,
-        cancel,
-        Duration::from_secs(90),
-    )?;
-    write_geotiff(path, &rendered, &region)?;
-    Ok(rendered.missing_tiles)
+    let mut task = GeoTiffTask::new(svc, bounds, zoom, layers)?;
+    loop {
+        match task.step(renderer, svc, cancel) {
+            Step::Pending(p) => {
+                progress(p);
+                std::thread::sleep(Duration::from_millis(4));
+            }
+            Step::Done(Err(e)) => return Err(e),
+            Step::Done(Ok((bytes, missing))) => {
+                let tmp = path.with_extension("tif.tmp");
+                std::fs::write(&tmp, bytes)
+                    .and_then(|_| std::fs::rename(&tmp, path))
+                    .map_err(|e| PrintError::Io(e.to_string()))?;
+                return Ok(missing);
+            }
+        }
+    }
 }
 
 #[cfg(test)]

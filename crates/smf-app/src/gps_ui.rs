@@ -49,7 +49,7 @@ impl GpsState {
     pub fn new() -> Self {
         let ports = smf_gps::available_ports();
         Self {
-            kind: if cfg!(windows) {
+            kind: if cfg!(any(windows, target_arch = "wasm32")) {
                 Kind::System
             } else {
                 Kind::Gpsd
@@ -141,12 +141,17 @@ impl MapPanel {
     pub(crate) fn gps_menu(&mut self, ui: &mut egui::Ui, editor: &mut Editor) {
         let g = &mut self.gps;
         ui.horizontal(|ui| {
-            for (k, label) in [
+            // Browsers can only use the device's own location; the rest need the desktop app.
+            #[cfg(not(target_arch = "wasm32"))]
+            let kinds = [
                 (Kind::System, "This computer"),
                 (Kind::Serial, "Serial GPS"),
                 (Kind::Gpsd, "gpsd"),
                 (Kind::Replay, "NMEA log"),
-            ] {
+            ];
+            #[cfg(target_arch = "wasm32")]
+            let kinds = [(Kind::System, "This device")];
+            for (k, label) in kinds {
                 ui.selectable_value(&mut g.kind, k, label);
             }
         });

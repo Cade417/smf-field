@@ -388,8 +388,15 @@ impl MapRenderer {
         plan
     }
 
-    /// Copy the target back to the CPU as tightly packed RGBA8 (tests / print).
-    pub fn read_pixels(&self) -> Option<Vec<u8>> {
+    /// The device this renderer draws with (needed to poll a `PendingRead`).
+    pub fn device(&self) -> &wgpu::Device {
+        &self.device
+    }
+
+    /// Start copying the target back to the CPU. The result is collected with
+    /// `PendingRead::poll`, which never blocks, so this works where the thread cannot wait
+    /// (browsers deliver the mapped buffer from their event loop).
+    pub fn begin_read(&self) -> Option<PendingRead> {
         let target = self.target.as_ref()?;
         let [w, h] = target.size;
         let row = (w * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
@@ -422,15 +429,59 @@ impl MapRenderer {
             },
         );
         self.queue.submit(Some(enc.finish()));
-        let slice = buf.slice(..);
-        slice.map_async(wgpu::MapMode::Read, |_| {});
+        let state = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let st = state.clone();
+        buf.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+            if let Ok(mut g) = st.lock() {
+                *g = Some(r.is_ok());
+            }
+        });
+        Some(PendingRead {
+            buf,
+            w,
+            h,
+            row,
+            state,
+        })
+    }
+
+    /// Copy the target back to the CPU as tightly packed RGBA8 (tests / print). Blocks the
+    /// calling thread, so it is not available in browsers: use `begin_read` there.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn read_pixels(&self) -> Option<Vec<u8>> {
+        let pending = self.begin_read()?;
         self.device.poll(wgpu::PollType::wait_indefinitely()).ok()?;
-        let data = slice.get_mapped_range().ok()?;
-        let mut out = Vec::with_capacity((w * h * 4) as usize);
-        for y in 0..h {
-            out.extend_from_slice(&data[(y * row) as usize..(y * row + w * 4) as usize]);
+        pending.poll(&self.device).flatten()
+    }
+}
+
+/// A GPU-to-CPU copy in progress (see `MapRenderer::begin_read`).
+pub struct PendingRead {
+    buf: wgpu::Buffer,
+    w: u32,
+    h: u32,
+    row: u32,
+    state: std::sync::Arc<std::sync::Mutex<Option<bool>>>,
+}
+
+impl PendingRead {
+    /// None while the copy is still running; Some(None) if it failed; otherwise the tightly
+    /// packed RGBA8 pixels. Safe to call every frame.
+    pub fn poll(&self, device: &wgpu::Device) -> Option<Option<Vec<u8>>> {
+        // On the desktop this lets the driver finish the mapping; in browsers it does nothing
+        // and the browser completes the mapping between frames.
+        let _ = device.poll(wgpu::PollType::Poll);
+        let ok = (*self.state.lock().ok()?)?;
+        if !ok {
+            return Some(None);
         }
-        Some(out)
+        let data = self.buf.slice(..).get_mapped_range().ok()?;
+        let mut out = Vec::with_capacity((self.w * self.h * 4) as usize);
+        for y in 0..self.h {
+            let start = (y * self.row) as usize;
+            out.extend_from_slice(&data[start..start + (self.w * 4) as usize]);
+        }
+        Some(Some(out))
     }
 }
 

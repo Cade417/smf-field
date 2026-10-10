@@ -4,6 +4,10 @@
 //! channel, so the map never blocks on a device.
 
 mod nmea;
+#[cfg(not(target_arch = "wasm32"))]
+mod sources;
+#[cfg(target_arch = "wasm32")]
+#[path = "sources_web.rs"]
 mod sources;
 #[cfg(windows)]
 mod wloc;
@@ -45,11 +49,18 @@ pub enum Event {
 pub struct Handle {
     pub rx: Receiver<Event>,
     stop: Arc<AtomicBool>,
+    /// Browser only: stops the geolocation watch.
+    #[cfg(target_arch = "wasm32")]
+    cleanup: std::cell::RefCell<Option<Box<dyn FnOnce()>>>,
 }
 
 impl Handle {
     pub fn stop(&self) {
         self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(target_arch = "wasm32")]
+        if let Some(f) = self.cleanup.borrow_mut().take() {
+            f();
+        }
     }
 }
 

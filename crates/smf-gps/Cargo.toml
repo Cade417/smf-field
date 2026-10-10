@@ -10,7 +10,13 @@ workspace = true
 
 [dependencies]
 serde_json.workspace = true
-serialport = { version = "4", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = ["Devices_Geolocation", "Foundation", "Win32_System_WinRT"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+serialport = { version = "4", default-features = false }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+web-sys = { version = "0.3", features = ["Window", "Navigator", "Geolocation", "Position", "PositionOptions", "PositionError", "Coordinates"] }

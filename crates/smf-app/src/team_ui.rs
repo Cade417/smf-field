@@ -155,6 +155,10 @@ impl TeamState {
         }
     }
 
+    pub fn ctx_handle(&self) -> Option<egui::Context> {
+        self.ctx.clone()
+    }
+
     pub fn signed_in(&self) -> bool {
         self.client.is_some()
     }

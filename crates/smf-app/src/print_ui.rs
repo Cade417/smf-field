@@ -42,6 +42,23 @@ pub enum JobState {
 pub struct JobHandle {
     pub state: Arc<Mutex<JobState>>,
     pub cancel: Arc<AtomicBool>,
+    /// Browsers have no threads: the job is stepped a little every frame instead.
+    #[cfg(target_arch = "wasm32")]
+    pub web: Option<WebJob>,
+}
+
+#[cfg(target_arch = "wasm32")]
+pub enum WebTask {
+    Pdf(smf_print::PdfTask),
+    GeoTiff(smf_print::GeoTiffTask),
+}
+
+#[cfg(target_arch = "wasm32")]
+pub struct WebJob {
+    renderer: MapRenderer,
+    svc: TileService,
+    task: WebTask,
+    file_name: String,
 }
 
 pub struct PrintUi {
@@ -177,6 +194,7 @@ impl MapPanel {
     }
 
     /// Spawn the render on its own thread. `path` is the output file.
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn start_print_job(
         &mut self,
         editor: &Editor,
@@ -268,7 +286,144 @@ impl MapPanel {
         });
     }
 
+    /// Start the render. In a browser the job is stepped each frame by `pump_web_job`, and
+    /// `path` is only the name of the downloaded file.
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn start_print_job(
+        &mut self,
+        editor: &Editor,
+        path: PathBuf,
+        geotiff_bounds: Option<[f64; 4]>,
+    ) {
+        let state = Arc::new(Mutex::new(JobState::Running(0.0)));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (device, queue) = (
+            self.render_state.device.clone(),
+            self.render_state.queue.clone(),
+        );
+        let ctx = self.team_ctx();
+        let layers = self.print_layers();
+        let mut spec = self.print.spec.clone();
+        spec.declination_deg = self.print.declination_on.then_some(self.print.declination);
+        spec.attribution = self.print_attribution();
+        let mut legend = self.legend_overlays();
+        let project = editor.project.clone();
+        let extra = self.smf_print_features();
+        legend.extend(
+            self.smf_print_legend()
+                .into_iter()
+                .map(|(name, n, color)| LegendOverlay {
+                    name: format!("{name} ({n})"),
+                    opacity: 1.0,
+                    color: Some(color),
+                }),
+        );
+        let (kind, zoom) = (self.print.kind, self.print.geotiff_zoom);
+        let svc = TileService::new(PathBuf::new(), move || {
+            if let Some(c) = &ctx {
+                c.request_repaint();
+            }
+        });
+        svc.set_offline(self.work_offline);
+        let task = match kind {
+            PrintKind::Pdf => {
+                smf_print::PdfTask::new(&svc, &spec, &layers, &project, &extra, &legend)
+                    .map(WebTask::Pdf)
+            }
+            PrintKind::GeoTiff => match geotiff_bounds {
+                Some(b) => {
+                    smf_print::GeoTiffTask::new(&svc, b, zoom, &layers).map(WebTask::GeoTiff)
+                }
+                None => Err(smf_print::PrintError::Render("nothing to export".into())),
+            },
+        };
+        let web = match task {
+            Ok(task) => Some(WebJob {
+                renderer: MapRenderer::new(&device, &queue),
+                svc,
+                task,
+                file_name: path.display().to_string(),
+            }),
+            Err(e) => {
+                *state.lock().unwrap() = JobState::Failed(e.to_string());
+                None
+            }
+        };
+        self.print.job = Some(JobHandle { state, cancel, web });
+    }
+
+    /// Advance the browser's print job for a few milliseconds.
+    #[cfg(target_arch = "wasm32")]
+    fn pump_web_job(&mut self, ctx: &egui::Context) {
+        use smf_print::Step;
+        let Some(job) = self.print.job.as_mut() else {
+            return;
+        };
+        let Some(web) = job.web.as_mut() else { return };
+        if !matches!(*job.state.lock().unwrap(), JobState::Running(_)) {
+            return;
+        }
+        let started = web_time::Instant::now();
+        let mut outcome: Option<JobState> = None;
+        while outcome.is_none() {
+            let (progress, done): (f32, Option<Result<(Vec<u8>, &'static str, Vec<String>, usize), smf_print::PrintError>>) =
+                match &mut web.task {
+                    WebTask::Pdf(t) => match t.step(&mut web.renderer, &web.svc, &job.cancel) {
+                        Step::Pending(p) => (p, None),
+                        Step::Done(r) => (
+                            1.0,
+                            Some(r.map(|o| (o.bytes, "application/pdf", o.warnings, o.missing_tiles))),
+                        ),
+                    },
+                    WebTask::GeoTiff(t) => match t.step(&mut web.renderer, &web.svc, &job.cancel) {
+                        Step::Pending(p) => (p, None),
+                        Step::Done(r) => (
+                            1.0,
+                            Some(r.map(|(b, m)| {
+                                let w = if m > 0 {
+                                    vec![format!("{m} map tile(s) could not be loaded; those areas show lower-resolution imagery.")]
+                                } else {
+                                    vec![]
+                                };
+                                (b, "image/tiff", w, m)
+                            })),
+                        ),
+                    },
+                };
+            match done {
+                None => {
+                    if let Ok(mut s) = job.state.lock() {
+                        *s = JobState::Running(progress);
+                    }
+                    if started.elapsed().as_millis() > 8 {
+                        break;
+                    }
+                }
+                Some(Err(smf_print::PrintError::Cancelled)) => outcome = Some(JobState::Cancelled),
+                Some(Err(e)) => outcome = Some(JobState::Failed(e.to_string())),
+                Some(Ok((bytes, mime, warnings, missing))) => {
+                    outcome = Some(
+                        match crate::platform::download_bytes(&web.file_name, mime, &bytes) {
+                            Ok(()) => JobState::Done {
+                                path: PathBuf::from(&web.file_name),
+                                warnings,
+                                missing,
+                            },
+                            Err(e) => JobState::Failed(e),
+                        },
+                    );
+                }
+            }
+        }
+        if let Some(o) = outcome {
+            *job.state.lock().unwrap() = o;
+            job.web = None;
+        }
+        ctx.request_repaint();
+    }
+
     /// Dev hook: print with the current view/basemap and exit when the job ends.
+    #[cfg(not(target_arch = "wasm32"))]
     #[allow(clippy::too_many_arguments)] // dev hook: mirrors the env-var fields one to one
     pub(crate) fn dev_print(
         &mut self,
@@ -356,7 +511,14 @@ impl MapPanel {
                     .as_ref()
                     .is_some_and(|j| matches!(*j.state.lock().unwrap(), JobState::Running(_)));
                 if ui
-                    .add_enabled(!busy, egui::Button::new("Choose file and start…"))
+                    .add_enabled(
+                        !busy,
+                        egui::Button::new(if cfg!(target_arch = "wasm32") {
+                            "Create and download"
+                        } else {
+                            "Choose file and start…"
+                        }),
+                    )
                     .clicked()
                 {
                     start = true;
@@ -606,6 +768,7 @@ impl MapPanel {
             }
             None
         };
+        #[cfg(not(target_arch = "wasm32"))]
         let Some(path) = rfd::FileDialog::new()
             .add_filter(label, &[ext])
             .set_file_name(format!("{name}.{ext}"))
@@ -613,10 +776,18 @@ impl MapPanel {
         else {
             return;
         };
+        // Browsers have no save dialog: the finished file is downloaded under this name.
+        #[cfg(target_arch = "wasm32")]
+        let path = {
+            let _ = label;
+            PathBuf::from(format!("{name}.{ext}"))
+        };
         self.start_print_job(editor, path, bounds);
     }
 
     fn print_progress_window(&mut self, ctx: &egui::Context) {
+        #[cfg(target_arch = "wasm32")]
+        self.pump_web_job(ctx);
         let Some(job) = &self.print.job else { return };
         let mut dismiss = false;
         let mut open_path: Option<PathBuf> = None;
@@ -650,6 +821,8 @@ impl MapPanel {
                         ui.weak(w);
                     }
                     ui.horizontal(|ui| {
+                        // A downloaded file is already with the user; there is nothing to open.
+                        #[cfg(not(target_arch = "wasm32"))]
                         if ui.button("Open").clicked() {
                             open_path = Some(path.clone());
                         }
@@ -671,10 +844,13 @@ impl MapPanel {
                     }
                 }
             });
+        #[cfg(not(target_arch = "wasm32"))]
         if let Some(p) = open_path {
             // ShellExecute via the `open` crate: no shell is involved, so file names can't inject commands.
             let _ = open::that(&p);
         }
+        #[cfg(target_arch = "wasm32")]
+        let _ = open_path;
         if dismiss {
             self.print.job = None;
         }

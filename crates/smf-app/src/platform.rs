@@ -74,7 +74,15 @@ pub fn download_bytes(file_name: &str, mime: &str, bytes: &[u8]) -> Result<(), S
     a.set_href(&url);
     a.set_download(file_name);
     a.click();
-    let _ = web_sys::Url::revoke_object_url(&url);
+    // Revoke later: some browsers cancel the download if the object URL disappears at once.
+    let url2 = url.clone();
+    let revoke = wasm_bindgen::closure::Closure::once_into_js(move || {
+        let _ = web_sys::Url::revoke_object_url(&url2);
+    });
+    if let Some(w) = web_sys::window() {
+        let _ =
+            w.set_timeout_with_callback_and_timeout_and_arguments_0(revoke.unchecked_ref(), 60_000);
+    }
     Ok(())
 }
 

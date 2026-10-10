@@ -14,10 +14,6 @@ mod map_panel;
 mod overlay;
 mod panels;
 mod platform;
-#[cfg(not(target_arch = "wasm32"))]
-mod print_ui;
-#[cfg(target_arch = "wasm32")]
-#[path = "print_ui_web.rs"]
 mod print_ui;
 mod smf_ui;
 mod store;

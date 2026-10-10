@@ -218,6 +218,12 @@ impl MapPanel {
         panel
     }
 
+    /// The egui context, for callbacks that must request a repaint (kept up to date by `team_tick`).
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    pub(crate) fn team_ctx(&self) -> Option<egui::Context> {
+        self.team.ctx_handle()
+    }
+
     pub fn basemap_id(&self) -> &str {
         &self.sources[self.selected].id
     }
