@@ -5,6 +5,7 @@ mod layers_ui;
 mod map_panel;
 mod overlay;
 mod panels;
+mod print_ui;
 
 use eframe::egui;
 use smf_features::{Editor, Geometry, Project, SavedView, Tool};
@@ -42,6 +43,8 @@ struct FieldApp {
     status: Option<(String, std::time::Instant)>,
     title: String,
     shot: Option<ScreenshotHook>,
+    /// SMF_PRINT / SMF_GEOTIFF: close the app when the print job ends.
+    exit_on_print: bool,
     /// Automated run: never open modal dialogs.
     quiet: bool,
 }
@@ -76,7 +79,12 @@ impl FieldApp {
             saved_revision: 0,
             status: None,
             title: String::new(),
-            quiet: shot.is_some() || std::env::var_os("SMF_IMPORT").is_some(),
+            exit_on_print: std::env::var_os("SMF_PRINT").is_some()
+                || std::env::var_os("SMF_GEOTIFF").is_some(),
+            quiet: shot.is_some()
+                || std::env::var_os("SMF_IMPORT").is_some()
+                || std::env::var_os("SMF_PRINT").is_some()
+                || std::env::var_os("SMF_GEOTIFF").is_some(),
             shot,
         };
         if let Some(p) = std::env::var_os("SMF_OPEN") {
@@ -89,7 +97,7 @@ impl FieldApp {
     }
 
     /// Verification hooks. SMF_CAM="lng,lat,distance_m,pitch_deg,heading_deg" starts in 3D at that
-    /// camera; SMF_SLOPE=deg|fire turns on slope shading; SMF_SELECT=<feature name> selects it; SMF_IMPORT=a;b imports files at startup; SMF_VIEW=lng,lat,zoom; SMF_DOWNLOAD=lng,lat,span,zmin,zmax,name; SMF_OFFLINE=1; SMF_BASEMAP=id; SMF_LAYER=file[@opacity].
+    /// camera; SMF_SLOPE=deg|fire turns on slope shading; SMF_SELECT=<feature name> selects it; SMF_IMPORT=a;b imports files at startup; SMF_VIEW=lng,lat,zoom; SMF_DOWNLOAD=lng,lat,span,zmin,zmax,name; SMF_OFFLINE=1; SMF_BASEMAP=id; SMF_LAYER=file[@opacity]; SMF_PRINT=out.pdf[,scale,dpi]; SMF_GEOTIFF=out.tif[,zoom,half_span_deg].
     fn apply_dev_env(&mut self) {
         if let Ok(v) = std::env::var("SMF_CAM") {
             let n: Vec<f64> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
@@ -143,6 +151,38 @@ impl FieldApp {
                 None => (v, 0.5),
             };
             self.map.dev_add_layer(&path, opacity);
+        }
+        if let Ok(v) = std::env::var("SMF_PRINT") {
+            // path[,scale_denominator,dpi]
+            let p: Vec<&str> = v.split(',').map(str::trim).collect();
+            let scale = p.get(1).and_then(|x| x.parse().ok()).unwrap_or(24_000.0);
+            let dpi = p.get(2).and_then(|x| x.parse().ok()).unwrap_or(150);
+            self.map.dev_print(
+                &self.editor,
+                PathBuf::from(p[0]),
+                print_ui::PrintKind::Pdf,
+                scale,
+                dpi,
+                0,
+                None,
+            );
+        }
+        if let Ok(v) = std::env::var("SMF_GEOTIFF") {
+            // path,zoom,half_span_degrees  (centered on SMF_VIEW)
+            let p: Vec<&str> = v.split(',').map(str::trim).collect();
+            let zoom = p.get(1).and_then(|x| x.parse().ok()).unwrap_or(14);
+            let span: f64 = p.get(2).and_then(|x| x.parse().ok()).unwrap_or(0.03);
+            let c = self.map.view.center;
+            let b = [c.lng - span, c.lat - span, c.lng + span, c.lat + span];
+            self.map.dev_print(
+                &self.editor,
+                PathBuf::from(p[0]),
+                print_ui::PrintKind::GeoTiff,
+                24_000.0,
+                150,
+                zoom,
+                Some(b),
+            );
         }
         if std::env::var_os("SMF_OFFLINE").is_some() {
             self.map.set_work_offline(true);
@@ -368,6 +408,15 @@ impl FieldApp {
                         do_import = true;
                         ui.close();
                     }
+                    ui.separator();
+                    if ui.button("Print map to PDF…").clicked() {
+                        self.map.open_print(print_ui::PrintKind::Pdf);
+                        ui.close();
+                    }
+                    if ui.button("Export GeoTIFF…").clicked() {
+                        self.map.open_print(print_ui::PrintKind::GeoTiff);
+                        ui.close();
+                    }
                     ui.menu_button("Export", |ui| {
                         for fmt in smf_io::Format::ALL {
                             if ui.button(fmt.label()).clicked() {
@@ -572,6 +621,19 @@ impl eframe::App for FieldApp {
         self.menu(ui);
         self.map.show(ui, &mut self.editor);
         self.screenshot_hook(&ctx);
+        if self.exit_on_print {
+            match self.map.print_outcome() {
+                Some(Ok(msg)) => {
+                    tracing::info!("print finished: {msg}");
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                Some(Err(e)) => {
+                    tracing::error!("print failed: {e}");
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                None => ctx.request_repaint_after(std::time::Duration::from_millis(200)),
+            }
+        }
     }
 }
 

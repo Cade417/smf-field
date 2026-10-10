@@ -453,6 +453,18 @@ pub fn plan_frame(
     opacity: f32,
 ) -> FramePlan {
     let tz = (view.zoom.round().max(0.0) as u8).min(max_zoom);
+    plan_frame_at(r, view, source, tz, opacity)
+}
+
+/// Like `plan_frame` but with an explicit tile zoom. Printing uses the next zoom *up*, so tiles are
+/// downsampled instead of stretched and output is at least as sharp as the screen.
+pub fn plan_frame_at(
+    r: &mut MapRenderer,
+    view: &smf_geo::MapView,
+    source: u16,
+    tz: u8,
+    opacity: f32,
+) -> FramePlan {
     let mut quads = Vec::new();
     let mut requests = Vec::new();
     let mut tiles = view.visible_tiles(tz);

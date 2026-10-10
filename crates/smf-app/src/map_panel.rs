@@ -4,6 +4,7 @@
 
 use crate::layers::LayerStore;
 use crate::layers_ui::{ActiveDownload, DownloadUi, OverlayLayer};
+use crate::print_ui::PrintUi;
 use crate::{overlay, panels};
 use directories::ProjectDirs;
 use eframe::egui::{self, Align2, Color32, Key, PointerButton, Pos2, Rect, Sense, Stroke, Vec2};
@@ -100,7 +101,7 @@ pub struct MapPanel {
     velocity: Vec2,
     last_frame: Instant,
     coord_format: CoordFormat,
-    render_state: egui_wgpu::RenderState,
+    pub(crate) render_state: egui_wgpu::RenderState,
     drag: Option<DragMode>,
     /// Set by the host to fit a bounding box on the next frame once the viewport size is known.
     pub pending_fit: Option<[f64; 4]>,
@@ -120,6 +121,8 @@ pub struct MapPanel {
     pub(crate) downloads: Vec<ActiveDownload>,
     pub(crate) was_downloading: bool,
     pub(crate) notice: Option<(String, Instant)>,
+    pub(crate) print: PrintUi,
+    pub(crate) cache_dir: std::path::PathBuf,
 }
 
 impl MapPanel {
@@ -133,7 +136,7 @@ impl MapPanel {
             .unwrap_or_else(|| std::env::temp_dir().join("smf-field-tiles"));
         tracing::info!("tile cache: {}", cache_dir.display());
         let ctx = cc.egui_ctx.clone();
-        let tiles = TileService::new(cache_dir, move || ctx.request_repaint());
+        let tiles = TileService::new(cache_dir.clone(), move || ctx.request_repaint());
         let center = LngLat::new(-92.5, 38.5);
         let dirs = ProjectDirs::from("org", "ShowMeFire", "Field");
         let offline_dir = dirs
@@ -188,6 +191,8 @@ impl MapPanel {
             downloads: vec![],
             was_downloading: false,
             notice: None,
+            print: PrintUi::default(),
+            cache_dir,
         };
         panel.init_layers();
         panel
@@ -355,6 +360,7 @@ impl MapPanel {
         });
         egui::CentralPanel::default().show(ui, |ui| self.map_area(ui, editor));
         self.layer_windows(ui.ctx(), editor);
+        self.print_window(ui.ctx(), editor);
     }
 
     fn shading_menu(&mut self, ui: &mut egui::Ui) {

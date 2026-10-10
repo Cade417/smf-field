@@ -9,3 +9,17 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+smf-geo.workspace = true
+smf-features.workspace = true
+smf-render.workspace = true
+smf-tiles.workspace = true
+smf-terrain.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+tiff = "0.11.3"
+utm = "0.1"
+
+[dev-dependencies]
+lopdf = "0.45"
+pollster = "1"

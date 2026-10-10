@@ -203,7 +203,7 @@ impl MapPanel {
     }
 
     /// Current viewport as (min_lng, min_lat, max_lng, max_lat).
-    fn view_bounds(&self) -> [f64; 4] {
+    pub(crate) fn view_bounds(&self) -> [f64; 4] {
         let s = self.view.size;
         let corners: Vec<LngLat> = [[0.0, 0.0], [s[0], 0.0], [s[0], s[1]], [0.0, s[1]]]
             .iter()
