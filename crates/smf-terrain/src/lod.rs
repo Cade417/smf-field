@@ -13,14 +13,7 @@ pub struct Chunk {
     pub id: TileId,
 }
 
-/// (min_x, min_y, max_x, max_y) in Mercator metres.
-pub fn tile_bounds_mercator(id: TileId) -> [f64; 4] {
-    let s = EARTH_CIRCUMFERENCE_M / (1u64 << id.z) as f64;
-    let half = EARTH_CIRCUMFERENCE_M / 2.0;
-    let x0 = -half + id.x as f64 * s;
-    let y1 = half - id.y as f64 * s;
-    [x0, y1 - s, x0 + s, y1]
-}
+pub use smf_geo::tile_bounds_mercator;
 
 /// Frustum test of an eye-relative AABB.
 fn in_frustum(planes: &[DVec4; 5], min: DVec3, max: DVec3) -> bool {

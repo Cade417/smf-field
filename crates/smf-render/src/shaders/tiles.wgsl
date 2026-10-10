@@ -13,12 +13,14 @@ struct VsIn {
     @location(0) pos: vec2<f32>,
     @location(1) uv: vec2<f32>,
     @location(2) layer: u32,
+    @location(3) alpha: f32,
 };
 
 struct VsOut {
     @builtin(position) clip: vec4<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) @interpolate(flat) layer: u32,
+    @location(2) alpha: f32,
 };
 
 @vertex
@@ -28,10 +30,13 @@ fn vs_main(in: VsIn) -> VsOut {
     out.clip = vec4<f32>(ndc, 0.0, 1.0);
     out.uv = in.uv;
     out.layer = in.layer;
+    out.alpha = in.alpha;
     return out;
 }
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    return textureSample(tiles, samp, in.uv, in.layer);
+    var c = textureSample(tiles, samp, in.uv, in.layer);
+    c.a = c.a * in.alpha;
+    return c;
 }

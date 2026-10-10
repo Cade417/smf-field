@@ -48,6 +48,7 @@ struct Globals {
     flags: [f32; 4],
     fog: [f32; 4],
     sky: [f32; 4],
+    extra: [f32; 4],
 }
 
 #[repr(C)]
@@ -77,8 +78,15 @@ pub struct ShadeVertex {
     pub texel_m: f32,
 }
 
+/// A draped overlay layer: the base chunks with this layer's imagery, drawn with opacity.
+pub struct OverlayFrame {
+    pub instances: Vec<ChunkInstance>,
+    pub opacity: f32,
+}
+
 pub struct TerrainFrame {
     pub instances: Vec<ChunkInstance>,
+    pub overlays: Vec<OverlayFrame>,
     pub view_proj: [[f32; 4]; 4],
     pub k: f32,
     pub eye_z: f32,
@@ -95,6 +103,7 @@ pub struct TerrainGpu {
     globals: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     terrain_pipeline: wgpu::RenderPipeline,
+    overlay_pipeline: wgpu::RenderPipeline,
     shade_pipeline: wgpu::RenderPipeline,
     grid_vb: wgpu::Buffer,
     grid_ib: wgpu::Buffer,
@@ -227,53 +236,75 @@ impl TerrainGpu {
 
         let grid_attrs = wgpu::vertex_attr_array![0 => Float32x3];
         let inst_attrs = wgpu::vertex_attr_array![1 => Float32x4, 2 => Float32x4, 3 => Float32x4];
-        let terrain_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("terrain"),
-            layout: Some(&layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_terrain"),
-                compilation_options: Default::default(),
-                buffers: &[
-                    Some(wgpu::VertexBufferLayout {
-                        array_stride: std::mem::size_of::<GridVertex>() as u64,
-                        step_mode: wgpu::VertexStepMode::Vertex,
-                        attributes: &grid_attrs,
+        let make_terrain_pipeline =
+            |label: &str,
+             fs_entry: &str,
+             blend: Option<wgpu::BlendState>,
+             depth_write: bool,
+             depth_compare: wgpu::CompareFunction| {
+                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some(label),
+                    layout: Some(&layout),
+                    vertex: wgpu::VertexState {
+                        module: &shader,
+                        entry_point: Some("vs_terrain"),
+                        compilation_options: Default::default(),
+                        buffers: &[
+                            Some(wgpu::VertexBufferLayout {
+                                array_stride: std::mem::size_of::<GridVertex>() as u64,
+                                step_mode: wgpu::VertexStepMode::Vertex,
+                                attributes: &grid_attrs,
+                            }),
+                            Some(wgpu::VertexBufferLayout {
+                                array_stride: std::mem::size_of::<ChunkInstance>() as u64,
+                                step_mode: wgpu::VertexStepMode::Instance,
+                                attributes: &inst_attrs,
+                            }),
+                        ],
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &shader,
+                        entry_point: Some(fs_entry),
+                        compilation_options: Default::default(),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format: FORMAT,
+                            blend,
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
                     }),
-                    Some(wgpu::VertexBufferLayout {
-                        array_stride: std::mem::size_of::<ChunkInstance>() as u64,
-                        step_mode: wgpu::VertexStepMode::Instance,
-                        attributes: &inst_attrs,
+                    // Skirts are single-sided strips and winding flips with mirrored views, so draw both sides.
+                    primitive: wgpu::PrimitiveState {
+                        cull_mode: None,
+                        ..Default::default()
+                    },
+                    depth_stencil: Some(wgpu::DepthStencilState {
+                        format: DEPTH_FORMAT,
+                        depth_write_enabled: Some(depth_write),
+                        depth_compare: Some(depth_compare),
+                        stencil: Default::default(),
+                        bias: Default::default(),
                     }),
-                ],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_terrain"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: FORMAT,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            // Skirts are single-sided strips and winding flips with mirrored views, so draw both sides.
-            primitive: wgpu::PrimitiveState {
-                cull_mode: None,
-                ..Default::default()
-            },
-            // Reversed-Z: near = 1, far = 0, so the test is Greater and the clear is 0.
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: DEPTH_FORMAT,
-                depth_write_enabled: Some(true),
-                depth_compare: Some(wgpu::CompareFunction::Greater),
-                stencil: Default::default(),
-                bias: Default::default(),
-            }),
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
+                    multisample: wgpu::MultisampleState::default(),
+                    multiview_mask: None,
+                    cache: None,
+                })
+            };
+        // Reversed-Z: near = 1, far = 0, so the base test is Greater and the clear is 0.
+        let terrain_pipeline = make_terrain_pipeline(
+            "terrain",
+            "fs_terrain",
+            None,
+            true,
+            wgpu::CompareFunction::Greater,
+        );
+        // Overlays re-draw identical geometry, so they pass on equal depth and never write it.
+        let overlay_pipeline = make_terrain_pipeline(
+            "terrain overlay",
+            "fs_overlay",
+            Some(wgpu::BlendState::ALPHA_BLENDING),
+            false,
+            wgpu::CompareFunction::GreaterEqual,
+        );
 
         let shade_attrs =
             wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32, 3 => Float32];
@@ -336,6 +367,7 @@ impl TerrainGpu {
             globals,
             bind_group,
             terrain_pipeline,
+            overlay_pipeline,
             shade_pipeline,
             grid_vb,
             grid_ib,
@@ -376,6 +408,7 @@ impl TerrainGpu {
         size: [u32; 2],
         p: &ShadeParams,
         f: Option<&TerrainFrame>,
+        overlay_opacity: f32,
     ) {
         let g = Globals {
             view_proj: f.map_or([[0.0; 4]; 4], |f| f.view_proj),
@@ -404,6 +437,7 @@ impl TerrainGpu {
                 0.0,
             ],
             sky: [0.62, 0.74, 0.90, 1.0],
+            extra: [overlay_opacity, 0.0, 0.0, 0.0],
         };
         queue.write_buffer(&self.globals, 0, bytemuck::bytes_of(&g));
     }
@@ -418,7 +452,7 @@ impl TerrainGpu {
         params: &ShadeParams,
     ) {
         self.ensure_depth(device, size);
-        self.write_globals(queue, size, params, Some(frame));
+        self.write_globals(queue, size, params, Some(frame), 1.0);
         if frame.instances.len() as u64 > self.instance_capacity {
             self.instance_capacity = (frame.instances.len() as u64).next_power_of_two();
             self.instances = device.create_buffer(&wgpu::BufferDescriptor {
@@ -454,7 +488,7 @@ impl TerrainGpu {
                     view: depth,
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Clear(0.0),
-                        store: wgpu::StoreOp::Discard,
+                        store: wgpu::StoreOp::Store,
                     }),
                     stencil_ops: None,
                 }),
@@ -470,6 +504,51 @@ impl TerrainGpu {
             pass.draw_indexed(0..self.index_count, 0, 0..frame.instances.len() as u32);
         }
         queue.submit(Some(enc.finish()));
+
+        // Each overlay needs its own opacity uniform and instance data. Queue writes land before the
+        // *next submit*, so every overlay is submitted separately to see its own values.
+        for ov in &frame.overlays {
+            if ov.instances.is_empty() {
+                continue;
+            }
+            self.write_globals(queue, size, params, Some(frame), ov.opacity);
+            queue.write_buffer(&self.instances, 0, bytemuck::cast_slice(&ov.instances));
+            let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("terrain overlay"),
+            });
+            {
+                let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("terrain overlay pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: target,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: depth,
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Discard,
+                        }),
+                        stencil_ops: None,
+                    }),
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                pass.set_pipeline(&self.overlay_pipeline);
+                pass.set_bind_group(0, &self.bind_group, &[]);
+                pass.set_vertex_buffer(0, self.grid_vb.slice(..));
+                pass.set_vertex_buffer(1, self.instances.slice(..));
+                pass.set_index_buffer(self.grid_ib.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..self.index_count, 0, 0..ov.instances.len() as u32);
+            }
+            queue.submit(Some(enc.finish()));
+        }
     }
 
     /// Record the 2D hillshade/slope overlay into an already-open pass (after the basemap).
@@ -485,7 +564,7 @@ impl TerrainGpu {
         if verts.is_empty() || !(params.hillshade || params.slope) {
             return;
         }
-        self.write_globals(queue, size, params, None);
+        self.write_globals(queue, size, params, None, 1.0);
         if verts.len() as u64 > self.shade_capacity {
             self.shade_capacity = (verts.len() as u64).next_power_of_two();
             self.shade_vb = device.create_buffer(&wgpu::BufferDescriptor {
@@ -554,12 +633,20 @@ pub fn plan_terrain(
     cam: &Camera3D,
     chunks: &[Chunk],
     source: u16,
+    overlays: &[(u16, f32, u8)],
     imagery: &mut TilePool,
     heights: &mut TilePool,
     frame: u64,
 ) -> Terrain3dPlan {
     let eye = cam.eye();
     let mut instances = Vec::with_capacity(chunks.len());
+    let mut overlay_frames: Vec<OverlayFrame> = overlays
+        .iter()
+        .map(|(_, opacity, _)| OverlayFrame {
+            instances: Vec::with_capacity(chunks.len()),
+            opacity: *opacity,
+        })
+        .collect();
     let (mut ireq, mut hreq) = (Vec::new(), Vec::new());
     for ch in chunks {
         let b = tile_bounds_mercator(ch.id);
@@ -592,7 +679,7 @@ pub fn plan_terrain(
             Some(r) => [r.u0, r.v0, r.scale, r.layer as f32],
             None => [0.0, 0.0, 1.0, -1.0],
         };
-        instances.push(ChunkInstance {
+        let base = ChunkInstance {
             tile: [
                 (b[0] - eye.x) as f32,
                 (b[1] - eye.y) as f32,
@@ -601,12 +688,46 @@ pub fn plan_terrain(
             ],
             img: pack(img),
             hgt: pack(hgt),
-        });
+        };
+        // Overlays share geometry and heights; only the imagery differs (and none = skip this chunk).
+        for ((osrc, _, omax), frame_ov) in overlays.iter().zip(&mut overlay_frames) {
+            // An overlay may stop at a coarser zoom than the basemap: never ask for tiles it lacks.
+            let mut want = ch.id;
+            while want.z > *omax {
+                want = want.parent().expect("z>0");
+            }
+            let ores = imagery.resolve(
+                &TileKey {
+                    source: *osrc,
+                    id: ch.id,
+                },
+                frame,
+            );
+            if !ores.is_some_and(|r| r.zoom >= want.z) {
+                request_chain(
+                    imagery,
+                    TileKey {
+                        source: *osrc,
+                        id: want,
+                    },
+                    prio,
+                    &mut ireq,
+                );
+            }
+            if let Some(r) = ores {
+                frame_ov.instances.push(ChunkInstance {
+                    img: pack(Some(r)),
+                    ..base
+                });
+            }
+        }
+        instances.push(base);
     }
     let scene_dist = cam.distance_m * cam.k();
     Terrain3dPlan {
         frame: TerrainFrame {
             instances,
+            overlays: overlay_frames,
             view_proj: cam.view_proj_rel().as_mat4().to_cols_array_2d(),
             k: cam.k() as f32,
             eye_z: eye.z as f32,

@@ -1,10 +1,13 @@
-use crate::{DiskCache, TileSource};
+use crate::{Backend, DiskCache, GeoRaster, Mbtiles, TileSource};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use smf_geo::TileId;
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::{Arc, Condvar, Mutex},
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -21,6 +24,33 @@ pub enum TileEvent {
     },
 }
 
+/// Tile bytes from a local provider: encoded image bytes (PNG/JPEG) or ready RGBA pixels.
+pub enum TileData {
+    Encoded(Vec<u8>),
+    Rgba(Vec<u8>),
+}
+
+/// A tile source that needs no network (local files).
+pub trait LocalProvider: Send + Sync {
+    fn tile(&self, id: TileId) -> Option<TileData>;
+}
+
+struct MbtilesProvider(Arc<Mbtiles>);
+
+impl LocalProvider for MbtilesProvider {
+    fn tile(&self, id: TileId) -> Option<TileData> {
+        self.0.get(id).map(TileData::Encoded)
+    }
+}
+
+struct GeoTiffProvider(Arc<GeoRaster>);
+
+impl LocalProvider for GeoTiffProvider {
+    fn tile(&self, id: TileId) -> Option<TileData> {
+        Some(TileData::Rgba(self.0.render_tile(id)))
+    }
+}
+
 struct Request {
     source: Arc<TileSource>,
     id: TileId,
@@ -33,11 +63,19 @@ struct Shared {
     wake: Condvar,
     in_flight: Mutex<HashSet<(String, TileId)>>,
     generation: Mutex<u64>,
+    providers: Mutex<HashMap<String, Arc<dyn LocalProvider>>>,
+    /// Read-only offline areas per source id, consulted before the cache and the network.
+    mounts: Mutex<HashMap<String, Vec<Arc<Mbtiles>>>>,
+    /// Work offline: never touch the network.
+    offline: AtomicBool,
 }
 
 /// Prioritized background loader. Each frame the UI bumps the generation and
 /// re-requests what it needs; queued work from older generations is dropped
 /// before any IO so fast panning never builds a backlog of tiles now off-screen.
+///
+/// Lookup order per tile: local provider (MBTiles/GeoTIFF source) -> mounted offline
+/// areas -> disk cache -> network (unless working offline).
 pub struct TileService {
     shared: Arc<Shared>,
     rx: Receiver<TileEvent>,
@@ -57,6 +95,9 @@ impl TileService {
             wake: Condvar::new(),
             in_flight: Mutex::new(HashSet::new()),
             generation: Mutex::new(0),
+            providers: Mutex::new(HashMap::new()),
+            mounts: Mutex::new(HashMap::new()),
+            offline: AtomicBool::new(false),
         });
         let (tx, rx) = unbounded();
         let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(wake);
@@ -89,7 +130,46 @@ impl TileService {
     }
 
     pub fn cache_for(&self, source_id: &str) -> Arc<DiskCache> {
-        open_cache(&self.caches, &self.cache_dir, source_id)
+        open_cache(&self.caches, &self.cache_dir, source_id).expect("tile cache")
+    }
+
+    pub fn set_offline(&self, offline: bool) {
+        self.shared.offline.store(offline, Ordering::Relaxed);
+    }
+
+    pub fn is_offline(&self) -> bool {
+        self.shared.offline.load(Ordering::Relaxed)
+    }
+
+    /// Make a source usable: opens its local file for MBTiles/GeoTIFF backends. HTTP and WMS need nothing.
+    pub fn register_source(&self, source: &TileSource) -> Result<(), String> {
+        let provider: Arc<dyn LocalProvider> = match &source.backend {
+            Backend::Http | Backend::Wms { .. } => return Ok(()),
+            Backend::Mbtiles { path } => {
+                let m = Mbtiles::open_read_only(path)
+                    .map_err(|e| format!("{}: not a usable MBTiles file ({e})", path.display()))?;
+                Arc::new(MbtilesProvider(Arc::new(m)))
+            }
+            Backend::Geotiff { path } => {
+                Arc::new(GeoTiffProvider(Arc::new(GeoRaster::open(path)?)))
+            }
+        };
+        self.shared
+            .providers
+            .lock()
+            .unwrap()
+            .insert(source.id.clone(), provider);
+        Ok(())
+    }
+
+    /// Serve `source_id` from an offline-area file before the cache or network.
+    pub fn mount_offline(&self, source_id: &str, area: Arc<Mbtiles>) {
+        let mut m = self.shared.mounts.lock().unwrap();
+        m.entry(source_id.to_owned()).or_default().push(area);
+    }
+
+    pub fn unmount_all(&self) {
+        self.shared.mounts.lock().unwrap().clear();
     }
 
     /// Start a new frame: requests tagged with older generations become stale.
@@ -129,13 +209,23 @@ impl TileService {
     }
 }
 
-fn open_cache(map: &CacheMap, dir: &Path, id: &str) -> Arc<DiskCache> {
+fn open_cache(map: &CacheMap, dir: &Path, id: &str) -> Option<Arc<DiskCache>> {
     let mut m = map.lock().unwrap();
-    m.entry(id.to_string())
-        .or_insert_with(|| {
-            Arc::new(DiskCache::open(&dir.join(format!("{id}.sqlite"))).expect("open tile cache"))
-        })
-        .clone()
+    if let Some(c) = m.get(id) {
+        return Some(c.clone());
+    }
+    match DiskCache::open(&dir.join(format!("{id}.sqlite"))) {
+        Ok(c) => {
+            let c = Arc::new(c);
+            m.insert(id.to_string(), c.clone());
+            Some(c)
+        }
+        Err(e) => {
+            // Tiles still load from the network; they just aren't cached until this succeeds.
+            tracing::warn!("tile cache for {id} unavailable: {e}");
+            None
+        }
+    }
 }
 
 fn worker(
@@ -176,17 +266,8 @@ fn worker(
                 q = shared.wake.wait(q).unwrap();
             }
         };
-        let cache = open_cache(&caches, &cache_dir, &req.source.id);
-        let bytes = cache.get(req.id).or_else(|| {
-            let url = req.source.tile_url(req.id);
-            let resp = client.get(&url).send().ok()?.error_for_status().ok()?;
-            let b = resp.bytes().ok()?.to_vec();
-            // Only cache bytes that decode, so a captive-portal HTML page can't poison the cache.
-            decode(&b)?;
-            cache.put(req.id, &b);
-            Some(b)
-        });
-        let ev = match bytes.and_then(|b| decode(&b)) {
+        let rgba = load_tile(&shared, &client, &caches, &cache_dir, &req);
+        let ev = match rgba {
             Some(rgba) => TileEvent::Ready {
                 source: req.source.id.clone(),
                 id: req.id,
@@ -207,7 +288,54 @@ fn worker(
     }
 }
 
-fn decode(bytes: &[u8]) -> Option<Vec<u8>> {
+fn load_tile(
+    shared: &Shared,
+    client: &reqwest::blocking::Client,
+    caches: &CacheMap,
+    cache_dir: &Path,
+    req: &Request,
+) -> Option<Vec<u8>> {
+    let (source, id) = (&req.source, req.id);
+    if let Some(p) = shared.providers.lock().unwrap().get(&source.id).cloned() {
+        return match p.tile(id)? {
+            TileData::Rgba(v) => Some(v),
+            TileData::Encoded(b) => decode(&b),
+        };
+    }
+    // Offline areas win over the cache: they are explicit, complete downloads.
+    let mounted = shared
+        .mounts
+        .lock()
+        .unwrap()
+        .get(&source.id)
+        .cloned()
+        .unwrap_or_default();
+    for m in &mounted {
+        if let Some(b) = m.get(id)
+            && let Some(rgba) = decode(&b)
+        {
+            return Some(rgba);
+        }
+    }
+    let cache = open_cache(caches, cache_dir, &source.id);
+    let bytes = cache.as_ref().and_then(|c| c.get(id)).or_else(|| {
+        if shared.offline.load(Ordering::Relaxed) {
+            return None;
+        }
+        let url = source.tile_url(id);
+        let resp = client.get(&url).send().ok()?.error_for_status().ok()?;
+        let b = resp.bytes().ok()?.to_vec();
+        // Only cache bytes that decode, so a captive-portal HTML page can't poison the cache.
+        decode(&b)?;
+        if let Some(c) = &cache {
+            c.put(id, &b);
+        }
+        Some(b)
+    });
+    bytes.and_then(|b| decode(&b))
+}
+
+pub fn decode(bytes: &[u8]) -> Option<Vec<u8>> {
     let img = image::load_from_memory(bytes).ok()?;
     let img = if img.width() != 256 || img.height() != 256 {
         img.resize_exact(256, 256, image::imageops::FilterType::Triangle)
@@ -222,16 +350,51 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
 
-    /// End to end against a local HTTP server: fetch, decode, cache, then serve from cache with the server gone.
-    #[test]
-    fn fetches_caches_and_works_offline() {
+    fn png() -> Vec<u8> {
         let mut png = Vec::new();
         image::RgbaImage::from_pixel(256, 256, image::Rgba([10, 20, 30, 255]))
             .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
             .unwrap();
+        png
+    }
+
+    fn source(url: String) -> Arc<TileSource> {
+        Arc::new(TileSource {
+            kind: Default::default(),
+            backend: Backend::Http,
+            overlay: false,
+            id: "t".into(),
+            name: "t".into(),
+            url,
+            subdomains: vec![],
+            max_zoom: 10,
+            attribution: String::new(),
+            offline_allowed: true,
+        })
+    }
+
+    fn wait(svc: &TileService) -> Option<TileEvent> {
+        for _ in 0..200 {
+            if let Some(e) = svc.try_recv() {
+                return Some(e);
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        None
+    }
+
+    fn tmp(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("smf-sched-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    }
+
+    /// End to end against a local HTTP server: fetch, decode, cache, then serve from cache with the server gone.
+    #[test]
+    fn fetches_caches_and_works_offline() {
+        let body = png();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-        let body = png.clone();
         let server = std::thread::spawn(move || {
             let (mut s, _) = listener.accept().unwrap();
             let mut buf = [0u8; 2048];
@@ -243,40 +406,94 @@ mod tests {
             );
             let _ = s.write_all(&body);
         });
-
-        let dir = std::env::temp_dir().join(format!("smf-sched-test-{}", std::process::id()));
+        let dir = tmp("net");
         let svc = TileService::new(dir.clone(), || {});
-        let src = Arc::new(TileSource {
-            kind: Default::default(),
-            id: "t".into(),
-            name: "t".into(),
-            url: format!("http://127.0.0.1:{port}/{{z}}/{{x}}/{{y}}"),
-            subdomains: vec![],
-            max_zoom: 10,
-            attribution: String::new(),
-            offline_allowed: true,
-        });
+        let src = source(format!("http://127.0.0.1:{port}/{{z}}/{{x}}/{{y}}"));
         let id = TileId::new(1, 0, 0);
-        let wait = |svc: &TileService| {
-            for _ in 0..200 {
-                if let Some(e) = svc.try_recv() {
-                    return e;
-                }
-                std::thread::sleep(Duration::from_millis(25));
-            }
-            panic!("timeout");
-        };
         svc.begin_frame();
         svc.request(&src, id, 0.0);
         match wait(&svc) {
-            TileEvent::Ready { rgba, .. } => assert_eq!(&rgba[..4], &[10, 20, 30, 255]),
+            Some(TileEvent::Ready { rgba, .. }) => assert_eq!(&rgba[..4], &[10, 20, 30, 255]),
             _ => panic!("expected Ready"),
         }
         server.join().unwrap();
         // Server is gone; the same tile must now come from disk.
         svc.begin_frame();
         svc.request(&src, id, 0.0);
-        assert!(matches!(wait(&svc), TileEvent::Ready { .. }));
+        assert!(matches!(wait(&svc), Some(TileEvent::Ready { .. })));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn work_offline_never_touches_the_network_but_serves_cache_and_mounts() {
+        // Nothing listens on this port: any network attempt would fail, so success proves it came from local data.
+        let src = source("http://127.0.0.1:9/{z}/{x}/{y}".into());
+        let dir = tmp("off");
+        let svc = TileService::new(dir.clone(), || {});
+        svc.set_offline(true);
+        assert!(svc.is_offline());
+        let cached = TileId::new(2, 1, 1);
+        svc.cache_for("t").put(cached, &png());
+        let mounted = TileId::new(3, 2, 2);
+        let area = Mbtiles::create(&dir.join("area.mbtiles")).unwrap();
+        area.put(mounted, &png()).unwrap();
+        area.flush().unwrap();
+        svc.mount_offline(
+            "t",
+            Arc::new(Mbtiles::open_read_only(&dir.join("area.mbtiles")).unwrap()),
+        );
+        let missing = TileId::new(4, 3, 3);
+        svc.begin_frame();
+        for (id, p) in [(cached, 0.0), (mounted, 1.0), (missing, 2.0)] {
+            svc.request(&src, id, p);
+        }
+        let mut ready = vec![];
+        let mut failed = vec![];
+        for _ in 0..3 {
+            match wait(&svc) {
+                Some(TileEvent::Ready { id, .. }) => ready.push(id),
+                Some(TileEvent::Failed { id, .. }) => failed.push(id),
+                None => panic!("timeout"),
+            }
+        }
+        ready.sort();
+        assert_eq!(ready, vec![cached, mounted]);
+        assert_eq!(
+            failed,
+            vec![missing],
+            "uncached tile fails fast instead of hitting the network"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn mbtiles_and_geotiff_backends_serve_local_tiles() {
+        let dir = tmp("local");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("local.mbtiles");
+        let m = Mbtiles::create(&path).unwrap();
+        m.put(TileId::new(5, 4, 3), &png()).unwrap();
+        drop(m);
+        let mut src = (*source(String::new())).clone();
+        src.id = "local".into();
+        src.backend = Backend::Mbtiles { path: path.clone() };
+        let svc = TileService::new(dir.clone(), || {});
+        svc.register_source(&src).unwrap();
+        let src = Arc::new(src);
+        svc.begin_frame();
+        svc.request(&src, TileId::new(5, 4, 3), 0.0);
+        assert!(matches!(wait(&svc), Some(TileEvent::Ready { .. })));
+        svc.request(&src, TileId::new(5, 0, 0), 0.0);
+        assert!(
+            matches!(wait(&svc), Some(TileEvent::Failed { .. })),
+            "tile not in the file"
+        );
+        // A bad path is reported at registration, not at draw time.
+        let mut bad = (*src).clone();
+        bad.backend = Backend::Mbtiles {
+            path: dir.join("missing.mbtiles"),
+        };
+        assert!(svc.register_source(&bad).is_err());
         let _ = std::fs::remove_dir_all(dir);
     }
 }

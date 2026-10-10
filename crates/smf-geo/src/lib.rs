@@ -156,6 +156,25 @@ pub fn mercator_to_lnglat(x: f64, y: f64) -> LngLat {
     LngLat { lng, lat }
 }
 
+/// (min_x, min_y, max_x, max_y) of a tile in Web Mercator metres.
+pub fn tile_bounds_mercator(id: TileId) -> [f64; 4] {
+    let s = EARTH_CIRCUMFERENCE_M / (1u64 << id.z) as f64;
+    let half = EARTH_CIRCUMFERENCE_M / 2.0;
+    let x0 = -half + id.x as f64 * s;
+    let y1 = half - id.y as f64 * s;
+    [x0, y1 - s, x0 + s, y1]
+}
+
+/// Tiles at zoom `z` covering (min_lng, min_lat, max_lng, max_lat), inclusive ranges (x0..=x1, y0..=y1).
+pub fn tile_range(
+    bounds: [f64; 4],
+    z: u8,
+) -> (std::ops::RangeInclusive<u32>, std::ops::RangeInclusive<u32>) {
+    let nw = TileId::from_lnglat(LngLat::new(bounds[0], bounds[3].min(MAX_LAT)), z);
+    let se = TileId::from_lnglat(LngLat::new(bounds[2], bounds[1].max(-MAX_LAT)), z);
+    (nw.x..=se.x, nw.y..=se.y)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -205,6 +224,25 @@ mod tests {
         let (x, y) = lnglat_to_mercator(p);
         let q = mercator_to_lnglat(x, y);
         assert!((p.lng - q.lng).abs() < 1e-9 && (p.lat - q.lat).abs() < 1e-9);
+    }
+
+    #[test]
+    fn tile_bounds_and_ranges() {
+        let h = EARTH_CIRCUMFERENCE_M / 2.0;
+        assert_eq!(tile_bounds_mercator(TileId::new(0, 0, 0)), [-h, -h, h, h]);
+        assert_eq!(
+            tile_bounds_mercator(TileId::new(1, 0, 0)),
+            [-h, 0.0, 0.0, h]
+        );
+        // A box inside one z10 tile gives a 1x1 range; the whole world at z2 is 4x4.
+        let t = TileId::from_lnglat(LngLat::new(-92.3, 38.6), 10);
+        let b = tile_bounds_mercator(t);
+        let nw = mercator_to_lnglat(b[0] + 1.0, b[3] - 1.0);
+        let se = mercator_to_lnglat(b[2] - 1.0, b[1] + 1.0);
+        let (xs, ys) = tile_range([nw.lng, se.lat, se.lng, nw.lat], 10);
+        assert_eq!((xs, ys), (t.x..=t.x, t.y..=t.y));
+        let (xs, ys) = tile_range([-180.0, -90.0, 180.0, 90.0], 2);
+        assert_eq!((xs.count(), ys.count()), (4, 4));
     }
 
     #[test]

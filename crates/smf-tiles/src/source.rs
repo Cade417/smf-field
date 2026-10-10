@@ -1,7 +1,8 @@
-use serde::Deserialize;
-use smf_geo::TileId;
+use serde::{Deserialize, Serialize};
+use smf_geo::{TileId, tile_bounds_mercator};
+use std::path::PathBuf;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum SourceKind {
     /// Display imagery (basemaps and overlays).
@@ -11,10 +12,35 @@ pub enum SourceKind {
     Terrarium,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// Where a source's tiles come from.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum Backend {
+    /// XYZ URL template (`url`).
+    #[default]
+    Http,
+    /// WMS GetMap against `url`, requested per tile in EPSG:3857.
+    Wms {
+        layers: String,
+        format: String,
+        transparent: bool,
+        version: String,
+    },
+    /// A local MBTiles file.
+    Mbtiles { path: PathBuf },
+    /// A local georeferenced GeoTIFF.
+    Geotiff { path: PathBuf },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TileSource {
     #[serde(default)]
     pub kind: SourceKind,
+    #[serde(default)]
+    pub backend: Backend,
+    /// Drawn on top of the basemap (with opacity) instead of replacing it.
+    #[serde(default)]
+    pub overlay: bool,
     pub id: String,
     pub name: String,
     /// Template with {z} {x} {y} {-y} (TMS row) and {s} (subdomain).
@@ -29,6 +55,41 @@ pub struct TileSource {
 
 impl TileSource {
     pub fn tile_url(&self, t: TileId) -> String {
+        if let Backend::Wms {
+            layers,
+            format,
+            transparent,
+            version,
+        } = &self.backend
+        {
+            let b = tile_bounds_mercator(t);
+            let sep = if self.url.contains('?') {
+                if self.url.ends_with('?') || self.url.ends_with('&') {
+                    ""
+                } else {
+                    "&"
+                }
+            } else {
+                "?"
+            };
+            // WMS 1.3.0 renamed SRS to CRS; EPSG:3857 keeps x,y axis order in both versions.
+            let srs = if version.starts_with("1.3") {
+                "CRS"
+            } else {
+                "SRS"
+            };
+            return format!(
+                "{}{sep}SERVICE=WMS&VERSION={version}&REQUEST=GetMap&LAYERS={}&STYLES=&{srs}=EPSG:3857&BBOX={},{},{},{}&WIDTH=256&HEIGHT=256&FORMAT={}&TRANSPARENT={}",
+                self.url,
+                url_encode(layers),
+                b[0],
+                b[1],
+                b[2],
+                b[3],
+                url_encode(format),
+                if *transparent { "TRUE" } else { "FALSE" },
+            );
+        }
         let mut u = self
             .url
             .replace("{z}", &t.z.to_string())
@@ -42,6 +103,25 @@ impl TileSource {
         }
         u
     }
+}
+
+/// Minimal percent-encoding for query values (keeps `,` so multi-layer lists stay readable).
+fn url_encode(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'-'
+            | b'_'
+            | b'.'
+            | b'~'
+            | b','
+            | b'/'
+            | b':' => (b as char).to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
 }
 
 #[derive(Deserialize)]
@@ -75,6 +155,50 @@ pub fn terrain_source() -> TileSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wms_urls_use_tile_bbox_in_3857() {
+        let mut s = default_sources().remove(0);
+        s.url = "https://example.org/wms".into();
+        s.backend = Backend::Wms {
+            layers: "a b,c".into(),
+            format: "image/png".into(),
+            transparent: true,
+            version: "1.1.1".into(),
+        };
+        let u = s.tile_url(TileId::new(1, 0, 0));
+        assert!(u.starts_with("https://example.org/wms?SERVICE=WMS&VERSION=1.1.1&REQUEST=GetMap&LAYERS=a%20b,c&STYLES=&SRS=EPSG:3857&BBOX=-20037508"), "{u}");
+        assert!(u.contains("WIDTH=256&HEIGHT=256&FORMAT=image/png&TRANSPARENT=TRUE"));
+        // A URL that already has a query string gets '&', and 1.3.0 uses CRS.
+        s.url = "https://example.org/wms?map=x.map".into();
+        s.backend = Backend::Wms {
+            layers: "l".into(),
+            format: "image/jpeg".into(),
+            transparent: false,
+            version: "1.3.0".into(),
+        };
+        let u = s.tile_url(TileId::new(0, 0, 0));
+        assert!(
+            u.starts_with("https://example.org/wms?map=x.map&SERVICE=WMS&VERSION=1.3.0"),
+            "{u}"
+        );
+        assert!(u.contains("&CRS=EPSG:3857&") && u.contains("TRANSPARENT=FALSE"));
+    }
+
+    #[test]
+    fn custom_sources_roundtrip_through_json() {
+        let mut s = default_sources().remove(0);
+        s.backend = Backend::Mbtiles {
+            path: PathBuf::from("a/b.mbtiles"),
+        };
+        s.overlay = true;
+        let back: TileSource = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back.backend, s.backend);
+        assert!(back.overlay);
+        // Catalog entries without the new fields still parse to Http / basemap.
+        assert_eq!(default_sources()[0].backend, Backend::Http);
+        assert!(!default_sources()[0].overlay);
+    }
 
     #[test]
     fn terrain_source_is_separate_from_basemaps() {

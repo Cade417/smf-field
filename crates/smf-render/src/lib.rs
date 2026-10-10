@@ -11,8 +11,8 @@ use smf_terrain::{Camera3D, Chunk};
 
 pub use pool::{POOL_LAYERS, Resolved, TILE_PX, TilePool};
 pub use terrain::{
-    ChunkInstance, GRID, ShadeParams, ShadeVertex, Terrain3dPlan, TerrainFrame, height_id,
-    plan_shade_2d, plan_terrain, texel_meters,
+    ChunkInstance, GRID, OverlayFrame, ShadeParams, ShadeVertex, Terrain3dPlan, TerrainFrame,
+    height_id, plan_shade_2d, plan_terrain, texel_meters,
 };
 pub use wgpu;
 
@@ -36,6 +36,8 @@ pub struct TileQuad {
     pub corners: [[f32; 2]; 4],
     pub uv: [f32; 4],
     pub layer: u32,
+    /// Layer opacity 0..=1 (overlays); basemaps use 1.
+    pub alpha: f32,
 }
 
 #[repr(C)]
@@ -44,6 +46,7 @@ struct Vertex {
     pos: [f32; 2],
     uv: [f32; 2],
     layer: u32,
+    alpha: f32,
 }
 
 struct Target {
@@ -151,7 +154,7 @@ impl MapRenderer {
                 buffers: &[Some(wgpu::VertexBufferLayout {
                     array_stride: std::mem::size_of::<Vertex>() as u64,
                     step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Uint32],
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Uint32, 3 => Float32],
                 })],
             },
             fragment: Some(wgpu::FragmentState {
@@ -306,6 +309,7 @@ impl MapRenderer {
                 pos: q.corners[i],
                 uv: [u, vv],
                 layer: q.layer,
+                alpha: q.alpha,
             };
             let (nw, ne, se, sw) = (v(0, u0, v0), v(1, u1, v0), v(2, u1, v1), v(3, u0, v1));
             verts.extend_from_slice(&[nw, ne, se, nw, se, sw]);
@@ -359,12 +363,14 @@ impl MapRenderer {
         cam: &Camera3D,
         chunks: &[Chunk],
         source: u16,
+        overlays: &[(u16, f32, u8)],
         params: &ShadeParams,
     ) -> Terrain3dPlan {
         let plan = plan_terrain(
             cam,
             chunks,
             source,
+            overlays,
             &mut self.imagery,
             &mut self.heights,
             self.frame,
@@ -444,6 +450,7 @@ pub fn plan_frame(
     view: &smf_geo::MapView,
     source: u16,
     max_zoom: u8,
+    opacity: f32,
 ) -> FramePlan {
     let tz = (view.zoom.round().max(0.0) as u8).min(max_zoom);
     let mut quads = Vec::new();
@@ -467,6 +474,7 @@ pub fn plan_frame(
                 corners,
                 uv: [res.u0, res.v0, res.u0 + res.scale, res.v0 + res.scale],
                 layer: res.layer,
+                alpha: opacity,
             });
         }
         if !res.is_some_and(|x| x.is_exact()) {
@@ -534,7 +542,7 @@ mod tests {
             &solid(255, 0, 0),
         );
         let view = MapView::new(LngLat::new(0.0, 0.0), 2.0, [256.0, 256.0]);
-        let plan = plan_frame(&mut r, &view, 0, 19);
+        let plan = plan_frame(&mut r, &view, 0, 19, 1.0);
         assert!(!plan.quads.is_empty());
         assert!(
             plan.requests.iter().any(|(k, _)| k.id.z == 2),
@@ -558,7 +566,7 @@ mod tests {
             },
             &solid(0, 255, 0),
         );
-        let plan = plan_frame(&mut r, &view, 0, 19);
+        let plan = plan_frame(&mut r, &view, 0, 19, 1.0);
         r.render(&plan.quads);
         let p = r.read_pixels().unwrap();
         assert_eq!(
@@ -605,7 +613,7 @@ mod tests {
             slope_alpha: 1.0,
             ..Default::default()
         };
-        let plan = plan_frame(&mut r, &view, 1, 19);
+        let plan = plan_frame(&mut r, &view, 1, 19, 1.0);
         let (shade, _) = plan_shade_2d(&view, plan.tile_zoom, &mut r.heights, r.frame);
         assert!(!shade.is_empty());
         r.render_2d(&plan.quads, &shade, &params);
@@ -620,7 +628,7 @@ mod tests {
         // Same view with flat terrain: no overlay, so the blue basemap shows through.
         r.begin_frame();
         r.upload_height(id, &vec![100.0f32; 256 * 256]);
-        let plan = plan_frame(&mut r, &view, 1, 19);
+        let plan = plan_frame(&mut r, &view, 1, 19, 1.0);
         let (shade, _) = plan_shade_2d(&view, plan.tile_zoom, &mut r.heights, r.frame);
         r.render_2d(&plan.quads, &shade, &params);
         let p = r.read_pixels().unwrap();
@@ -661,7 +669,7 @@ mod tests {
                 sun_altitude_deg: 35.0,
                 ..Default::default()
             };
-            let plan = plan_frame(&mut r, &view, 1, 19);
+            let plan = plan_frame(&mut r, &view, 1, 19, 1.0);
             let (shade, _) = plan_shade_2d(&view, plan.tile_zoom, &mut r.heights, r.frame);
             r.render_2d(&plan.quads, &shade, &params);
             let p = r.read_pixels().unwrap();
@@ -704,7 +712,7 @@ mod tests {
         r.begin_frame();
         r.upload_tile(TileKey { source: 1, id }, &solid(0, 200, 0));
         r.upload_height(id, &vec![100.0f32; 256 * 256]);
-        let plan = r.render_3d(&cam, &chunks, 1, &ShadeParams::default());
+        let plan = r.render_3d(&cam, &chunks, 1, &[], &ShadeParams::default());
         assert_eq!(plan.frame.instances.len(), 1);
         let p = r.read_pixels().unwrap();
         assert_eq!(
@@ -726,7 +734,7 @@ mod tests {
             slope_alpha: 1.0,
             ..Default::default()
         };
-        let _ = r.render_3d(&cam, &chunks, 1, &params);
+        let _ = r.render_3d(&cam, &chunks, 1, &[], &params);
         let p = r.read_pixels().unwrap();
         let c = px(&p, 128, 64, 64);
         assert!(
@@ -766,7 +774,7 @@ mod tests {
         r.begin_frame();
         r.upload_tile(TileKey { source: 1, id }, &solid(200, 0, 0));
         r.upload_height(id, &h);
-        let _ = r.render_3d(&cam, &[Chunk { id }], 1, &ShadeParams::default());
+        let _ = r.render_3d(&cam, &[Chunk { id }], 1, &[], &ShadeParams::default());
         let p = r.read_pixels().unwrap();
         // Something red (terrain) must be visible, and it must not be the whole frame (sky above).
         let red = (0..128 * 128)
@@ -774,5 +782,123 @@ mod tests {
             .count();
         assert!(red > 50, "terrain should be visible, red px = {red}");
         assert!(red < 128 * 128, "sky should be visible above the horizon");
+    }
+
+    fn to_lin(c: u8) -> f32 {
+        let c = c as f32 / 255.0;
+        if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    }
+
+    fn to_srgb(l: f32) -> f32 {
+        let c = if l <= 0.003_130_8 {
+            l * 12.92
+        } else {
+            1.055 * l.powf(1.0 / 2.4) - 0.055
+        };
+        c * 255.0
+    }
+
+    /// Blending happens in linear light because the target is sRGB, so the expected value is
+    /// computed the same way.
+    fn expect_mix(base: [u8; 3], over: [u8; 3], opacity: f32) -> [f32; 3] {
+        let m = |i: usize| to_srgb(to_lin(base[i]) * (1.0 - opacity) + to_lin(over[i]) * opacity);
+        [m(0), m(1), m(2)]
+    }
+
+    fn close(got: [u8; 4], want: [f32; 3], tol: f32) -> bool {
+        (0..3).all(|i| (got[i] as f32 - want[i]).abs() <= tol)
+    }
+
+    #[test]
+    fn overlay_layers_blend_with_opacity_in_2d() {
+        let Some((device, queue)) = headless() else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let mut r = MapRenderer::new(&device, &queue);
+        r.ensure_target([128, 128]);
+        r.begin_frame();
+        let id = TileId::new(2, 1, 1);
+        r.upload_tile(TileKey { source: 1, id }, &solid(220, 40, 40)); // basemap
+        r.upload_tile(TileKey { source: 2, id }, &solid(30, 60, 240)); // overlay
+        let view = MapView::new(LngLat::new(-45.0, 40.0), 2.0, [128.0, 128.0]);
+        let base = plan_frame(&mut r, &view, 1, 19, 1.0);
+        let mut quads = base.quads.clone();
+        for opacity in [0.0f32, 0.5, 1.0] {
+            let over = plan_frame(&mut r, &view, 2, 19, opacity);
+            let mut all = quads.clone();
+            all.extend(over.quads);
+            r.render(&all);
+            let p = r.read_pixels().unwrap();
+            let got = px(&p, 128, 64, 64);
+            let want = expect_mix([220, 40, 40], [30, 60, 240], opacity);
+            assert!(
+                close(got, want, 3.0),
+                "opacity {opacity}: got {got:?}, want {want:?}"
+            );
+        }
+        quads.clear();
+    }
+
+    #[test]
+    fn overlay_layers_drape_on_3d_terrain_and_respect_opacity() {
+        let Some((device, queue)) = headless() else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let id = TileId::from_lnglat(LngLat::new(-92.3, 38.6), 10);
+        let b = smf_terrain::tile_bounds_mercator(id);
+        let center = smf_geo::mercator_to_lnglat((b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0);
+        let cam = Camera3D {
+            target: center,
+            target_elev_m: 100.0,
+            distance_m: 20_000.0,
+            pitch: 89.0f64.to_radians(),
+            viewport: [128.0, 128.0],
+            ..Camera3D::default()
+        };
+        let mut r = MapRenderer::new(&device, &queue);
+        r.ensure_target([128, 128]);
+        r.begin_frame();
+        r.upload_tile(TileKey { source: 1, id }, &solid(0, 200, 0));
+        r.upload_tile(TileKey { source: 2, id }, &solid(240, 0, 100));
+        r.upload_height(id, &vec![100.0f32; 256 * 256]);
+        for opacity in [0.0f32, 0.4, 1.0] {
+            let plan = r.render_3d(
+                &cam,
+                &[Chunk { id }],
+                1,
+                &[(2, opacity, 19)],
+                &ShadeParams::default(),
+            );
+            assert_eq!(plan.frame.overlays.len(), 1);
+            assert_eq!(plan.frame.overlays[0].instances.len(), 1);
+            let p = r.read_pixels().unwrap();
+            let got = px(&p, 128, 64, 64);
+            let want = expect_mix([0, 200, 0], [240, 0, 100], opacity);
+            assert!(
+                close(got, want, 3.0),
+                "opacity {opacity}: got {got:?}, want {want:?}"
+            );
+        }
+        // An overlay with no tile loaded draws nothing and leaves the base intact.
+        let plan = r.render_3d(
+            &cam,
+            &[Chunk { id }],
+            1,
+            &[(3, 1.0, 19)],
+            &ShadeParams::default(),
+        );
+        assert!(plan.frame.overlays[0].instances.is_empty());
+        assert!(
+            plan.imagery_requests.iter().any(|(k, _)| k.source == 3),
+            "missing overlay tiles are requested"
+        );
+        let p = r.read_pixels().unwrap();
+        assert_eq!(px(&p, 128, 64, 64), [0, 200, 0, 255]);
     }
 }

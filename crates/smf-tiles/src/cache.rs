@@ -15,9 +15,11 @@ impl DiskCache {
             let _ = std::fs::create_dir_all(dir);
         }
         let conn = Connection::open(path)?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
-        // Several workers open the same file; wait instead of failing on a brief write lock.
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        // Several workers open the same file at once. The busy timeout must come first: without it
+        // the WAL pragma below fails instantly with SQLITE_BUSY when another connection is initializing.
+        conn.busy_timeout(std::time::Duration::from_secs(10))?;
+        // Persistent once set, so a lost race here is harmless.
+        let _ = conn.pragma_update(None, "journal_mode", "WAL");
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS tiles (
                 zoom_level INTEGER, tile_column INTEGER, tile_row INTEGER,
@@ -65,6 +67,28 @@ impl DiskCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn many_threads_can_open_the_same_new_cache_at_once() {
+        let dir = std::env::temp_dir().join(format!("smf-cache-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("race.sqlite");
+        let handles: Vec<_> = (0..12)
+            .map(|i| {
+                let p = path.clone();
+                std::thread::spawn(move || {
+                    let c = DiskCache::open(&p).map_err(|e| e.to_string())?;
+                    c.put(TileId::new(5, i, 0), b"x");
+                    Ok::<_, String>(())
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap().expect("concurrent open must not fail");
+        }
+        assert_eq!(DiskCache::open(&path).unwrap().count(), 12);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn roundtrip_and_tms_rows() {

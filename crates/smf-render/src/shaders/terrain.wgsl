@@ -11,6 +11,7 @@ struct Globals {
     flags: vec4<f32>,         // hill on, slope on, slope preset (0 degrees, 1 fire %), exaggeration
     fog: vec4<f32>,           // fog start, fog end (scene metres), unused, unused
     sky: vec4<f32>,           // sky/fog colour
+    extra: vec4<f32>,         // overlay opacity, unused, unused, unused
 };
 
 @group(0) @binding(0) var<uniform> g: Globals;
@@ -113,25 +114,44 @@ fn vs_terrain(in: GridIn) -> TerrainOut {
     return o;
 }
 
+// Slope classes then hillshade, applied to a draped colour.
+fn shade_rgb(rgb_in: vec3<f32>, h_layer: i32, h_uv: vec2<f32>, texel_m: f32) -> vec3<f32> {
+    var rgb = rgb_in;
+    if (h_layer >= 0) {
+        // Slope classes describe the real ground; only the lighting follows the exaggeration.
+        if (g.flags.y > 0.5) {
+            let s = slope_class(normal_at(h_layer, h_uv, texel_m, 1.0));
+            rgb = mix(rgb, s.rgb, s.a * g.shade.y);
+        }
+        if (g.flags.x > 0.5) {
+            let lum = clamp(hill_factor(normal_at(h_layer, h_uv, texel_m, g.flags.w)), 0.35, 1.25);
+            rgb = rgb * mix(1.0, lum, g.shade.x);
+        }
+    }
+    return rgb;
+}
+
 @fragment
 fn fs_terrain(in: TerrainOut) -> @location(0) vec4<f32> {
     var rgb = vec3<f32>(0.62, 0.64, 0.60);
     if (in.img_layer >= 0) {
         rgb = textureSample(imagery, samp, in.img_uv, in.img_layer).rgb;
     }
-    if (in.h_layer >= 0) {
-        // Slope classes describe the real ground; only the lighting follows the exaggeration.
-        if (g.flags.y > 0.5) {
-            let s = slope_class(normal_at(in.h_layer, in.h_uv, in.texel_m, 1.0));
-            rgb = mix(rgb, s.rgb, s.a * g.shade.y);
-        }
-        if (g.flags.x > 0.5) {
-            let lum = clamp(hill_factor(normal_at(in.h_layer, in.h_uv, in.texel_m, g.flags.w)), 0.35, 1.25);
-            rgb = rgb * mix(1.0, lum, g.shade.x);
-        }
-    }
+    rgb = shade_rgb(rgb, in.h_layer, in.h_uv, in.texel_m);
     let fog = clamp((in.dist - g.fog.x) / max(g.fog.y - g.fog.x, 1.0), 0.0, 1.0);
     return vec4<f32>(mix(rgb, g.sky.rgb, fog * fog), 1.0);
+}
+
+// Overlay layers: same mesh and depth as the base pass, blended on top with opacity.
+@fragment
+fn fs_overlay(in: TerrainOut) -> @location(0) vec4<f32> {
+    if (in.img_layer < 0) {
+        discard;
+    }
+    let t = textureSample(imagery, samp, in.img_uv, in.img_layer);
+    let rgb = shade_rgb(t.rgb, in.h_layer, in.h_uv, in.texel_m);
+    let fog = clamp((in.dist - g.fog.x) / max(g.fog.y - g.fog.x, 1.0), 0.0, 1.0);
+    return vec4<f32>(mix(rgb, g.sky.rgb, fog * fog), t.a * g.extra.x);
 }
 
 // ---------------------------------------------------------------- 2D overlay

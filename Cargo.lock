@@ -3755,6 +3755,8 @@ dependencies = [
  "eframe",
  "image",
  "rfd",
+ "serde",
+ "serde_json",
  "smf-data",
  "smf-features",
  "smf-geo",
@@ -3838,10 +3840,13 @@ dependencies = [
  "reqwest",
  "rusqlite",
  "serde",
+ "serde_json",
  "smf-geo",
  "thiserror 2.0.21",
+ "tiff",
  "toml",
  "tracing",
+ "utm",
 ]
 
 [[package]]

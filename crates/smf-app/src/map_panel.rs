@@ -2,6 +2,8 @@
 //! and overlays. The renderer draws offscreen; the texture is shown as an egui
 //! image with egui-painted features and chrome on top.
 
+use crate::layers::LayerStore;
+use crate::layers_ui::{ActiveDownload, DownloadUi, OverlayLayer};
 use crate::{overlay, panels};
 use directories::ProjectDirs;
 use eframe::egui::{self, Align2, Color32, Key, PointerButton, Pos2, Rect, Sense, Stroke, Vec2};
@@ -10,7 +12,7 @@ use smf_features::{Editor, Geometry, Hit, Tool, pick, snap};
 use smf_geo::{LngLat, MapView, TileId, meters_per_pixel};
 use smf_render::{MapRenderer, ShadeParams, TileKey, plan_frame};
 use smf_terrain::{Camera3D, HeightField, decode_terrarium, select_chunks};
-use smf_tiles::{TileEvent, TileService, TileSource, basemaps, terrain_source};
+use smf_tiles::{OfflineArea, TileEvent, TileService, TileSource, basemaps, terrain_source};
 use std::{
     collections::HashMap,
     sync::Arc,
@@ -82,16 +84,16 @@ impl Proj<'_> {
 }
 
 pub struct MapPanel {
-    sources: Vec<Arc<TileSource>>,
-    selected: usize,
-    terrain_src: Arc<TileSource>,
+    pub(crate) sources: Vec<Arc<TileSource>>,
+    pub(crate) selected: usize,
+    pub(crate) terrain_src: Arc<TileSource>,
     pub view: MapView,
     pub cam: Camera3D,
     pub mode: ViewMode,
     pub shade2d: ShadeParams,
     pub shade3d: ShadeParams,
     renderer: MapRenderer,
-    tiles: TileService,
+    pub(crate) tiles: TileService,
     texture: Option<egui::TextureId>,
     failed: HashMap<TileKey, Instant>,
     heights: HeightField,
@@ -105,6 +107,19 @@ pub struct MapPanel {
     cursor_elev: Option<f32>,
     /// Draw-call stats shown in the status bar (3D).
     last_chunks: usize,
+    pub(crate) overlays: Vec<OverlayLayer>,
+    /// Custom layers removed this session (indices into `sources` must stay stable).
+    pub(crate) hidden: std::collections::HashSet<String>,
+    pub(crate) store: LayerStore,
+    pub(crate) add_input: Option<crate::layers::AddLayerInput>,
+    pub(crate) add_error: Option<String>,
+    pub(crate) dl: DownloadUi,
+    pub(crate) areas: Vec<OfflineArea>,
+    pub(crate) offline_dir: std::path::PathBuf,
+    pub(crate) work_offline: bool,
+    pub(crate) downloads: Vec<ActiveDownload>,
+    pub(crate) was_downloading: bool,
+    pub(crate) notice: Option<(String, Instant)>,
 }
 
 impl MapPanel {
@@ -120,7 +135,17 @@ impl MapPanel {
         let ctx = cc.egui_ctx.clone();
         let tiles = TileService::new(cache_dir, move || ctx.request_repaint());
         let center = LngLat::new(-92.5, 38.5);
-        Self {
+        let dirs = ProjectDirs::from("org", "ShowMeFire", "Field");
+        let offline_dir = dirs
+            .as_ref()
+            .map(|d| d.data_local_dir().join("offline"))
+            .unwrap_or_else(|| std::env::temp_dir().join("smf-field-offline"));
+        let store = LayerStore::new(
+            dirs.as_ref()
+                .map(|d| d.config_dir().join("layers.json"))
+                .unwrap_or_else(|| std::env::temp_dir().join("smf-field-layers.json")),
+        );
+        let mut panel = Self {
             sources: basemaps().into_iter().map(Arc::new).collect(),
             selected: 0,
             terrain_src: Arc::new(terrain_source()),
@@ -151,7 +176,21 @@ impl MapPanel {
             pending_fit: None,
             cursor_elev: None,
             last_chunks: 0,
-        }
+            overlays: vec![],
+            hidden: Default::default(),
+            store,
+            add_input: None,
+            add_error: None,
+            dl: DownloadUi::default(),
+            areas: vec![],
+            offline_dir,
+            work_offline: false,
+            downloads: vec![],
+            was_downloading: false,
+            notice: None,
+        };
+        panel.init_layers();
+        panel
     }
 
     pub fn basemap_id(&self) -> &str {
@@ -213,6 +252,7 @@ impl MapPanel {
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui, editor: &mut Editor) {
+        self.poll_downloads();
         egui::Panel::top("toolbar").show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.label("Basemap");
@@ -220,7 +260,9 @@ impl MapPanel {
                     .selected_text(&self.sources[self.selected].name)
                     .show_ui(ui, |ui| {
                         for (i, s) in self.sources.iter().enumerate() {
-                            ui.selectable_value(&mut self.selected, i, &s.name);
+                            if !s.overlay && !self.hidden.contains(&s.id) {
+                                ui.selectable_value(&mut self.selected, i, &s.name);
+                            }
                         }
                     });
                 ui.separator();
@@ -228,6 +270,8 @@ impl MapPanel {
                 ui.selectable_value(&mut want, ViewMode::Flat, "2D");
                 ui.selectable_value(&mut want, ViewMode::Terrain, "3D");
                 self.set_mode(want);
+                ui.menu_button("Layers", |ui| self.layers_menu(ui));
+                ui.menu_button("Offline", |ui| self.offline_menu(ui));
                 ui.menu_button("Shading", |ui| self.shading_menu(ui));
                 ui.separator();
                 ui.label("Coords");
@@ -281,6 +325,18 @@ impl MapPanel {
                     ui.separator();
                     ui.label(egui::RichText::new(m).strong());
                 }
+                if self.work_offline {
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new("OFFLINE")
+                            .strong()
+                            .color(Color32::from_rgb(230, 160, 60)),
+                    );
+                }
+                if let Some((msg, _)) = &self.notice {
+                    ui.separator();
+                    ui.label(msg);
+                }
                 if let Some(e) = self.cursor_elev {
                     ui.separator();
                     ui.label(format!("Elev {e:.0} m ({:.0} ft)", e * 3.280_84));
@@ -298,6 +354,7 @@ impl MapPanel {
             });
         });
         egui::CentralPanel::default().show(ui, |ui| self.map_area(ui, editor));
+        self.layer_windows(ui.ctx(), editor);
     }
 
     fn shading_menu(&mut self, ui: &mut egui::Ui) {
@@ -362,8 +419,8 @@ impl MapPanel {
             self.register_texture();
         }
         match self.mode {
-            ViewMode::Flat => self.render_flat(&src),
-            ViewMode::Terrain => self.render_terrain(&src),
+            ViewMode::Flat => self.render_flat(),
+            ViewMode::Terrain => self.render_terrain(),
         }
         if let Some(id) = self.texture {
             ui.painter().image(
@@ -482,7 +539,8 @@ impl MapPanel {
         self.tiles.request(&src, id, prio);
     }
 
-    fn request_imagery(&mut self, src: &Arc<TileSource>, reqs: &[(TileKey, f32)]) {
+    /// Queue tile requests; each key carries its source index so overlays fetch from their own source.
+    fn request_imagery(&mut self, reqs: &[(TileKey, f32)]) {
         for (key, prio) in reqs.iter().take(MAX_REQUESTS_PER_FRAME) {
             if self
                 .failed
@@ -491,21 +549,48 @@ impl MapPanel {
             {
                 continue;
             }
-            self.tiles.request(src, key.id, *prio);
+            if let Some(src) = self.sources.get(key.source as usize).cloned() {
+                self.tiles.request(&src, key.id, *prio);
+            }
         }
     }
 
-    fn render_flat(&mut self, src: &Arc<TileSource>) {
+    /// Visible overlays as (source index, opacity, source max zoom).
+    fn active_overlays(&self) -> Vec<(usize, f32, u8)> {
+        self.overlays
+            .iter()
+            .filter(|o| {
+                o.visible && o.opacity > 0.0 && !self.hidden.contains(&self.sources[o.source].id)
+            })
+            .map(|o| (o.source, o.opacity, self.sources[o.source].max_zoom))
+            .collect()
+    }
+
+    fn render_flat(&mut self) {
+        let base = self.sources[self.selected].clone();
         let plan = plan_frame(
             &mut self.renderer,
             &self.view,
             self.selected as u16,
-            src.max_zoom,
+            base.max_zoom,
+            1.0,
         );
-        self.request_imagery(src, &plan.requests);
+        let (mut quads, mut reqs, zoom) = (plan.quads, plan.requests, plan.tile_zoom);
+        for (idx, opacity, max_zoom) in self.active_overlays() {
+            let p = plan_frame(
+                &mut self.renderer,
+                &self.view,
+                idx as u16,
+                max_zoom,
+                opacity,
+            );
+            quads.extend(p.quads);
+            reqs.extend(p.requests);
+        }
+        self.request_imagery(&reqs);
         let params = self.shade2d;
         let verts = if params.hillshade || params.slope {
-            let (v, reqs) = self.renderer.plan_shade(&self.view, plan.tile_zoom);
+            let (v, reqs) = self.renderer.plan_shade(&self.view, zoom);
             for (k, p) in reqs.iter().take(80) {
                 self.request_terrain_tile(k.id, *p);
             }
@@ -513,22 +598,28 @@ impl MapPanel {
         } else {
             vec![]
         };
-        self.renderer.render_2d(&plan.quads, &verts, &params);
+        self.renderer.render_2d(&quads, &verts, &params);
     }
 
-    fn render_terrain(&mut self, src: &Arc<TileSource>) {
+    fn render_terrain(&mut self) {
+        let base_max = self.sources[self.selected].max_zoom;
         // Follow the loaded ground under the target, then keep the eye out of the hillside.
         if let Some(h) = self.heights.sample(self.cam.target) {
             self.cam.target_elev_m += (h as f64 - self.cam.target_elev_m) * 0.25;
         }
         self.cam.enforce_clearance(&self.heights);
-        let chunks = select_chunks(&self.cam, &self.heights, src.max_zoom, SPLIT_PX, MAX_CHUNKS);
+        let chunks = select_chunks(&self.cam, &self.heights, base_max, SPLIT_PX, MAX_CHUNKS);
         self.last_chunks = chunks.len();
         let params = self.shade3d;
-        let plan = self
-            .renderer
-            .render_3d(&self.cam, &chunks, self.selected as u16, &params);
-        self.request_imagery(src, &plan.imagery_requests);
+        let overlays: Vec<(u16, f32, u8)> = self
+            .active_overlays()
+            .into_iter()
+            .map(|(i, o, z)| (i as u16, o, z))
+            .collect();
+        let plan =
+            self.renderer
+                .render_3d(&self.cam, &chunks, self.selected as u16, &overlays, &params);
+        self.request_imagery(&plan.imagery_requests);
         for (k, p) in plan.height_requests.iter().take(80) {
             self.request_terrain_tile(k.id, *p);
         }

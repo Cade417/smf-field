@@ -1,5 +1,7 @@
 //! ShowMeFire Field desktop entry point.
 
+mod layers;
+mod layers_ui;
 mod map_panel;
 mod overlay;
 mod panels;
@@ -87,7 +89,7 @@ impl FieldApp {
     }
 
     /// Verification hooks. SMF_CAM="lng,lat,distance_m,pitch_deg,heading_deg" starts in 3D at that
-    /// camera; SMF_SLOPE=deg|fire turns on slope shading; SMF_SELECT=<feature name> selects it; SMF_IMPORT=a;b imports files at startup.
+    /// camera; SMF_SLOPE=deg|fire turns on slope shading; SMF_SELECT=<feature name> selects it; SMF_IMPORT=a;b imports files at startup; SMF_VIEW=lng,lat,zoom; SMF_DOWNLOAD=lng,lat,span,zmin,zmax,name; SMF_OFFLINE=1; SMF_BASEMAP=id; SMF_LAYER=file[@opacity].
     fn apply_dev_env(&mut self) {
         if let Ok(v) = std::env::var("SMF_CAM") {
             let n: Vec<f64> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
@@ -101,6 +103,49 @@ impl FieldApp {
             } else {
                 tracing::warn!("SMF_CAM needs 5 numbers: lng,lat,distance_m,pitch_deg,heading_deg");
             }
+        }
+        if let Ok(v) = std::env::var("SMF_VIEW") {
+            let n: Vec<f64> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+            if let [lng, lat, zoom] = n[..] {
+                self.map.view.center = LngLat::new(lng, lat);
+                self.map.view.zoom = zoom;
+            } else {
+                tracing::warn!("SMF_VIEW needs 3 numbers: lng,lat,zoom");
+            }
+        }
+        if let Ok(v) = std::env::var("SMF_DOWNLOAD") {
+            let parts: Vec<&str> = v.split(',').map(str::trim).collect();
+            if let [lng, lat, span, zmin, zmax, name] = parts[..]
+                && let (Ok(lng), Ok(lat), Ok(span), Ok(zmin), Ok(zmax)) = (
+                    lng.parse::<f64>(),
+                    lat.parse::<f64>(),
+                    span.parse::<f64>(),
+                    zmin.parse::<u8>(),
+                    zmax.parse::<u8>(),
+                )
+            {
+                self.map.dev_download(
+                    [lng - span, lat - span, lng + span, lat + span],
+                    zmin,
+                    zmax,
+                    name,
+                );
+            } else {
+                tracing::warn!("SMF_DOWNLOAD needs lng,lat,span_deg,zmin,zmax,name");
+            }
+        }
+        if let Ok(id) = std::env::var("SMF_BASEMAP") {
+            self.map.set_basemap(&id);
+        }
+        if let Ok(v) = std::env::var("SMF_LAYER") {
+            let (path, opacity) = match v.rsplit_once('@') {
+                Some((p, o)) => (p.to_owned(), o.parse().unwrap_or(0.5)),
+                None => (v, 0.5),
+            };
+            self.map.dev_add_layer(&path, opacity);
+        }
+        if std::env::var_os("SMF_OFFLINE").is_some() {
+            self.map.set_work_offline(true);
         }
         if let Ok(v) = std::env::var("SMF_SLOPE") {
             for p in [&mut self.map.shade2d, &mut self.map.shade3d] {
