@@ -236,6 +236,24 @@ impl MapPanel {
                 .map_or(t.saved.team_name.clone(), |m| m.team_name.clone());
         ui.label(egui::RichText::new(format!("Team: {team_name}")).strong());
         ui.weak(format!("Signed in as {}", t.saved.display_name));
+        if let Some(p) = t.me.as_ref().and_then(|m| m.plan.as_ref()) {
+            let line = format!(
+                "Plan: {} ({}). Members {}/{}, maps {}/{}",
+                p.plan,
+                p.status,
+                p.usage.members,
+                p.limits.max_members,
+                p.usage.maps,
+                p.limits.max_maps
+            );
+            if p.status == "active" {
+                ui.weak(line);
+            } else {
+                // A lapsed plan makes the team read-only; say so where people will see it.
+                ui.colored_label(Color32::from_rgb(230, 160, 60), line);
+                ui.colored_label(Color32::from_rgb(230, 160, 60), &p.message);
+            }
+        }
         if let Some(me) = &t.me {
             ui.collapsing(format!("Members ({})", me.members.len()), |ui| {
                 for m in &me.members {
@@ -427,7 +445,7 @@ impl MapPanel {
                 ui.add(egui::TextEdit::singleline(&mut t.form.team_name).desired_width(160.0));
             });
             ui.horizontal(|ui| {
-                ui.label("Server's team-creation key");
+                ui.label("Show Me Fire account token");
                 ui.add(
                     egui::TextEdit::singleline(&mut t.form.create_key)
                         .password(true)
@@ -448,7 +466,7 @@ impl MapPanel {
                     t.form.creating = false;
                 }
             });
-            ui.weak("The key is set by whoever runs the server; it is not saved.");
+            ui.weak("Creating a team needs a Show Me Fire account on a paid plan. Teammates only need the join code. The token is not saved.");
         }
         if let Some(s) = &t.status {
             ui.label(s);
@@ -485,7 +503,7 @@ impl TeamState {
         name: String,
     ) {
         if name.is_empty() || team.is_empty() || key.is_empty() {
-            self.status = Some("Enter a team name, your name and the creation key.".into());
+            self.status = Some("Enter a team name, your name and your account token.".into());
             return;
         }
         self.status = Some("Creating...".into());

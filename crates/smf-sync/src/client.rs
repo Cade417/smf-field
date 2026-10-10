@@ -59,6 +59,42 @@ pub struct Me {
     pub team_id: String,
     pub team_name: String,
     pub members: Vec<Member>,
+    /// The team's plan and quotas (absent from older servers).
+    #[serde(default)]
+    pub plan: Option<PlanInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Default)]
+pub struct PlanLimits {
+    #[serde(default)]
+    pub max_members: u64,
+    #[serde(default)]
+    pub max_maps: u64,
+    #[serde(default)]
+    pub max_features: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Default)]
+pub struct PlanUsage {
+    #[serde(default)]
+    pub members: u64,
+    #[serde(default)]
+    pub maps: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Default)]
+pub struct PlanInfo {
+    pub plan: String,
+    /// "active", "expired" or "suspended"; when not active the team is read-only.
+    pub status: String,
+    #[serde(default)]
+    pub expires_at: Option<u64>,
+    #[serde(default)]
+    pub message: String,
+    #[serde(default)]
+    pub limits: PlanLimits,
+    #[serde(default)]
+    pub usage: PlanUsage,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -218,19 +254,22 @@ impl FieldClient {
         format!("{}{API}{path}", self.base)
     }
 
-    /// Needs the operator's create key: team creation is off on servers without one.
+    /// Create a team. `credential` is a Show Me Fire account token (`fldacct_...`), which
+    /// applies the account's plan; anything else is treated as the server operator's key.
     pub fn create_team(
         &self,
-        create_key: &str,
+        credential: &str,
         team: &str,
         display: &str,
     ) -> Result<Creds, SyncError> {
-        let r = self
-            .http
-            .post(self.url("/teams"))
-            .header("X-Field-Create-Key", create_key)
-            .json(&json!({"team_name": team, "display_name": display}));
-        Self::parse(self.send(r)?)
+        let credential = credential.trim();
+        let req = self.http.post(self.url("/teams"));
+        let req = if credential.starts_with("fldacct_") {
+            req.bearer_auth(credential)
+        } else {
+            req.header("X-Field-Create-Key", credential)
+        };
+        Self::parse(self.send(req.json(&json!({"team_name": team, "display_name": display})))?)
     }
 
     pub fn join(&self, code: &str, display: &str) -> Result<Creds, SyncError> {

@@ -7,8 +7,8 @@ mod engine;
 mod worker;
 
 pub use client::{
-    Creds, Events, FieldClient, MapDoc, MapInfo, Me, Member, Position, RemoteOp, SyncError,
-    TeamPosition,
+    Creds, Events, FieldClient, MapDoc, MapInfo, Me, Member, PlanInfo, PlanLimits, PlanUsage,
+    Position, RemoteOp, SyncError, TeamPosition,
 };
 pub use engine::{
     LocalOp, SyncState, ack_snapshot, apply_remote, diff, load_full, new_uid, snapshot,
