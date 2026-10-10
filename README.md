@@ -23,6 +23,11 @@ not a monorepo).
   mode; the app refuses to bulk-download sources whose terms forbid it.
 - **Custom layers**: XYZ/TMS URLs, WMS, local MBTiles, local GeoTIFF; overlays with opacity in 2D
   and draped in 3D.
+- **what3words** (needs your own API key): type `///word.word.word` in the toolbar to fly to the
+  3 m square, show three-word addresses in the cursor readout (the `///` coordinate mode), and
+  switch on a 3 m grid layer when zoomed in. Enter the key under what3words > API key; it is stored
+  unencrypted in the app's settings folder. The convert and grid endpoints are not on what3words'
+  free plan, and everything is online-only (the word list is proprietary).
 - **Show Me Fire data (on by default)**: live fire incidents, incident footprints, detections,
   events, burn bans and fire-weather alerts; fire danger, temperature, humidity, wind, fuel
   moisture, precipitation and spread-rate rasters; point conditions under the cursor; the
@@ -57,6 +62,7 @@ hands-on testing.
 | `smf-io` | GeoJSON, GPX, KML/KMZ, Shapefile, CSV, `.smfmap` |
 | `smf-print` | page layout, PDF writer, scale-accurate rendering, GeoTIFF export |
 | `smf-data` | Show Me Fire client, layers, background refresher, forecast, snapshots |
+| `smf-w3w` | what3words v3 client and three-word parsing |
 | `smf-app` | the egui application |
 
 Only `smf-app` depends on egui; tokio is not used (blocking HTTP on worker threads).
@@ -67,7 +73,7 @@ Visual checks use the app's own rendering, never an OS screen capture (that reco
 `SMF_SCREENSHOT=out.png` (+`SMF_SCREENSHOT_SECS`), `SMF_VIEW=lng,lat,zoom`, `SMF_CAM=...` (3D),
 `SMF_DEMO=1`, `SMF_IMPORT=a;b`, `SMF_DOWNLOAD=...`, `SMF_OFFLINE=1`, `SMF_LAYER=file[@opacity]`,
 `SMF_PRINT=out.pdf[,scale,dpi]` (+`SMF_PRINT_DELAY`), `SMF_GEOTIFF=out.tif[,zoom,half_span]`,
-`SMF_INFO=<layer>`, `SMF_COND=lng,lat`, `SMF_FORECAST=<hours>`, `SMF_ABOUT=1`. Hooks that set a
+`SMF_W3W_SEARCH=a.b.c`/`SMF_W3W_GRID=1`/`SMF_W3W_HOVER=lng,lat` (+`W3W_API_KEY`, `SMF_W3W_BASE`), `SMF_INFO=<layer>`, `SMF_COND=lng,lat`, `SMF_FORECAST=<hours>`, `SMF_ABOUT=1`. Hooks that set a
 non-interactive run suppress modal dialogs.
 
 ## Known limits
@@ -77,6 +83,8 @@ non-interactive run suppress modal dialogs.
 - PDF text uses the standard Helvetica fonts (Latin-1 plus common punctuation).
 - Shapefile import supports geographic, UTM (metres) and Web Mercator; other projections are refused
   with a message instead of being misplaced.
+- what3words was verified against a local mock of the documented v3 API, not the live service;
+  the grid is not included in printed maps.
 - Vector basemaps (Protomaps) and WASM/web builds are not implemented.
 - Live incident markers are not clustered when zoomed far out.
 - Installer packaging (`[package.metadata.packager]`) and the release workflow are configured but

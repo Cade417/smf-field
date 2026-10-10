@@ -8,6 +8,7 @@ mod panels;
 mod print_ui;
 mod smf_ui;
 mod update;
+mod w3w_ui;
 
 use eframe::egui;
 use smf_features::{Editor, Geometry, Project, SavedView, Tool};
@@ -106,7 +107,7 @@ impl FieldApp {
     }
 
     /// Verification hooks. SMF_CAM="lng,lat,distance_m,pitch_deg,heading_deg" starts in 3D at that
-    /// camera; SMF_SLOPE=deg|fire turns on slope shading; SMF_SELECT=<feature name> selects it; SMF_IMPORT=a;b imports files at startup; SMF_VIEW=lng,lat,zoom; SMF_DOWNLOAD=lng,lat,span,zmin,zmax,name; SMF_OFFLINE=1; SMF_BASEMAP=id; SMF_INFO=<layer id>; SMF_COND=lng,lat; SMF_FORECAST=<lead hours>; SMF_API_BASE=<url>; SMF_LAYER=file[@opacity]; SMF_PRINT=out.pdf[,scale,dpi] (+SMF_PRINT_DELAY secs); SMF_GEOTIFF=out.tif[,zoom,half_span_deg].
+    /// camera; SMF_SLOPE=deg|fire turns on slope shading; SMF_SELECT=<feature name> selects it; SMF_IMPORT=a;b imports files at startup; SMF_VIEW=lng,lat,zoom; SMF_DOWNLOAD=lng,lat,span,zmin,zmax,name; SMF_OFFLINE=1; SMF_BASEMAP=id; SMF_INFO=<layer id>; SMF_COND=lng,lat; SMF_W3W_SEARCH=a.b.c; SMF_W3W_GRID=1; SMF_W3W_HOVER=lng,lat (all need W3W_API_KEY; SMF_W3W_BASE=<url> points at a mock); SMF_FORECAST=<lead hours>; SMF_API_BASE=<url>; SMF_LAYER=file[@opacity]; SMF_PRINT=out.pdf[,scale,dpi] (+SMF_PRINT_DELAY secs); SMF_GEOTIFF=out.tif[,zoom,half_span_deg].
     fn apply_dev_env(&mut self) {
         if let Ok(v) = std::env::var("SMF_CAM") {
             let n: Vec<f64> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
@@ -208,6 +209,18 @@ impl FieldApp {
             let n: Vec<f64> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
             if let [lng, lat] = n[..] {
                 self.map.dev_conditions = Some(LngLat::new(lng, lat));
+            }
+        }
+        if let Ok(v) = std::env::var("SMF_W3W_SEARCH") {
+            self.map.w3w.dev_search = Some(v);
+        }
+        if std::env::var_os("SMF_W3W_GRID").is_some() {
+            self.map.w3w.grid_on = true;
+        }
+        if let Ok(v) = std::env::var("SMF_W3W_HOVER") {
+            let n: Vec<f64> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+            if let [lng, lat] = n[..] {
+                self.map.w3w.dev_hover = Some(LngLat::new(lng, lat));
             }
         }
         if std::env::var_os("SMF_OFFLINE").is_some() {

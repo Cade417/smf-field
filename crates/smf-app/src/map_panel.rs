@@ -6,6 +6,7 @@ use crate::layers::LayerStore;
 use crate::layers_ui::{ActiveDownload, DownloadUi, OverlayLayer};
 use crate::print_ui::PrintUi;
 use crate::smf_ui::SmfState;
+use crate::w3w_ui::W3wState;
 use crate::{overlay, panels};
 use directories::ProjectDirs;
 use eframe::egui::{self, Align2, Color32, Key, PointerButton, Pos2, Rect, Sense, Stroke, Vec2};
@@ -40,6 +41,7 @@ enum CoordFormat {
     Dd,
     Dms,
     Utm,
+    W3w,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -124,6 +126,7 @@ pub struct MapPanel {
     pub(crate) notice: Option<(String, Instant)>,
     pub(crate) print: PrintUi,
     pub(crate) smf: SmfState,
+    pub(crate) w3w: W3wState,
     /// SMF_COND verification hook: query conditions here on the first frame.
     pub dev_conditions: Option<LngLat>,
     pub(crate) cache_dir: std::path::PathBuf,
@@ -197,6 +200,7 @@ impl MapPanel {
             notice: None,
             print: PrintUi::default(),
             smf: SmfState::new(&cc.egui_ctx),
+            w3w: W3wState::new(),
             dev_conditions: None,
             cache_dir,
         };
@@ -248,7 +252,7 @@ impl MapPanel {
         let avail = [self.view.size[0] * 0.8, self.view.size[1] * 0.8];
         let z = (avail[0] / w).min(avail[1] / h).log2();
         self.view.center = center;
-        self.view.zoom = z.clamp(0.0, 17.0);
+        self.view.zoom = z.clamp(0.0, 19.0);
         // Same framing for the 3D camera.
         self.cam.target = center;
         self.cam.target_elev_m = self.heights.sample(center).unwrap_or(0.0) as f64;
@@ -265,6 +269,7 @@ impl MapPanel {
     pub fn show(&mut self, ui: &mut egui::Ui, editor: &mut Editor) {
         self.poll_downloads();
         self.poll_smf(ui.ctx());
+        self.poll_w3w(ui.ctx());
         if let Some(ll) = self.dev_conditions.take() {
             self.query_conditions(ll, ui.ctx());
         }
@@ -289,11 +294,13 @@ impl MapPanel {
                 ui.menu_button("Layers", |ui| self.layers_menu(ui));
                 ui.menu_button("Offline", |ui| self.offline_menu(ui));
                 ui.menu_button("Shading", |ui| self.shading_menu(ui));
+                self.w3w_toolbar(ui, editor);
                 ui.separator();
                 ui.label("Coords");
                 ui.selectable_value(&mut self.coord_format, CoordFormat::Dd, "DD");
                 ui.selectable_value(&mut self.coord_format, CoordFormat::Dms, "DMS");
                 ui.selectable_value(&mut self.coord_format, CoordFormat::Utm, "UTM");
+                ui.selectable_value(&mut self.coord_format, CoordFormat::W3w, "///");
                 ui.separator();
                 if ui.button("North up").clicked() {
                     self.view.angle = 0.0;
@@ -381,6 +388,7 @@ impl MapPanel {
         self.layer_windows(ui.ctx(), editor);
         self.print_window(ui.ctx(), editor);
         self.smf_windows(ui.ctx(), editor);
+        self.w3w_window(ui.ctx());
     }
 
     fn shading_menu(&mut self, ui: &mut egui::Ui) {
@@ -472,6 +480,7 @@ impl MapPanel {
             },
         };
         self.draw_smf_data(&painter, &pj, rect);
+        self.draw_w3w(&painter, &pj, rect);
         overlay::draw_project(&painter, &pj, editor);
         let proj = self.proj();
         let cursor_ll = resp
@@ -489,6 +498,9 @@ impl MapPanel {
         self.draw_chrome(ui, cursor_ll, rect, ppp, &src);
         self.draw_smf_legends(&painter, rect);
         self.smf_conditions_tick(resp.hover_pos(), cursor_ll, ui.ctx());
+        if self.coord_format == CoordFormat::W3w {
+            self.w3w_hover_tick(resp.hover_pos(), cursor_ll, ui.ctx());
+        }
     }
 
     fn proj(&self) -> Proj<'_> {
@@ -945,11 +957,14 @@ impl MapPanel {
             || shade.hillshade
             || shade.slope
             || self.cursor_elev.is_some();
-        let attribution = if uses_terrain {
+        let mut attribution = if uses_terrain {
             format!("{} | {}", src.attribution, self.terrain_src.attribution)
         } else {
             src.attribution.clone()
         };
+        if self.coord_format == CoordFormat::W3w || self.w3w.grid_on || self.w3w.found.is_some() {
+            attribution.push_str(" | what3words");
+        }
         pill(
             attribution,
             Align2::RIGHT_BOTTOM,
@@ -963,6 +978,7 @@ impl MapPanel {
                 CoordFormat::Utm => {
                     smf_geo::format_utm(ll).unwrap_or_else(|| "UTM n/a at this latitude".into())
                 }
+                CoordFormat::W3w => self.w3w_readout(ll),
             };
             pill(
                 text,

@@ -3612,6 +3612,8 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "rustls-platform-verifier",
+ "serde",
+ "serde_urlencoded",
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
@@ -3968,6 +3970,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_urlencoded"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3491c14715ca2294c4d6a88f15e84739788c1d030eed8c110436aafdaa2f3fd"
+dependencies = [
+ "form_urlencoded",
+ "itoa",
+ "ryu",
+ "serde",
+]
+
+[[package]]
 name = "sha2"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4095,6 +4109,7 @@ dependencies = [
  "smf-render",
  "smf-terrain",
  "smf-tiles",
+ "smf-w3w",
  "tracing",
  "tracing-subscriber",
 ]
@@ -4202,6 +4217,17 @@ dependencies = [
  "toml",
  "tracing",
  "utm",
+]
+
+[[package]]
+name = "smf-w3w"
+version = "0.1.0"
+dependencies = [
+ "reqwest",
+ "serde",
+ "serde_json",
+ "smf-geo",
+ "thiserror 2.0.21",
 ]
 
 [[package]]

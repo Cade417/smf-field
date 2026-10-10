@@ -19,6 +19,7 @@ smf-features = { path = "crates/smf-features" }
 smf-io = { path = "crates/smf-io" }
 smf-print = { path = "crates/smf-print" }
 smf-data = { path = "crates/smf-data" }
+smf-w3w = { path = "crates/smf-w3w" }
 eframe = { version = "0.36", default-features = false, features = ["wgpu", "default_fonts", "wayland", "x11", "accesskit"] }
 anyhow = "1"
 thiserror = "2"

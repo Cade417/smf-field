@@ -21,6 +21,7 @@ smf-features.workspace = true
 smf-io.workspace = true
 smf-print.workspace = true
 smf-data.workspace = true
+smf-w3w.workspace = true
 eframe.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
