@@ -14,7 +14,6 @@ use crate::team_ui::TeamState;
 use crate::trails_ui::TrailState;
 use crate::w3w_ui::W3wState;
 use crate::{overlay, panels};
-use directories::ProjectDirs;
 use eframe::egui::{self, Align2, Color32, Key, PointerButton, Pos2, Rect, Sense, Stroke, Vec2};
 use eframe::egui_wgpu;
 use smf_features::{Editor, Geometry, Hit, Tool, pick, snap};
@@ -22,11 +21,8 @@ use smf_geo::{LngLat, MapView, TileId, meters_per_pixel};
 use smf_render::{MapRenderer, ShadeParams, TileKey, plan_frame};
 use smf_terrain::{Camera3D, HeightField, decode_terrarium, select_chunks};
 use smf_tiles::{OfflineArea, TileEvent, TileService, TileSource, basemaps, terrain_source};
-use std::{
-    collections::HashMap,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{collections::HashMap, sync::Arc, time::Duration};
+use web_time::Instant;
 
 const MAX_ZOOM: f64 = 22.0;
 /// Don't re-request a failed tile for a while so a dead server isn't hammered every frame.
@@ -154,23 +150,13 @@ impl MapPanel {
             .wgpu_render_state
             .clone()
             .expect("wgpu render state (renderer must be wgpu)");
-        let cache_dir = ProjectDirs::from("org", "ShowMeFire", "Field")
-            .map(|d| d.cache_dir().join("tiles"))
-            .unwrap_or_else(|| std::env::temp_dir().join("smf-field-tiles"));
+        let cache_dir = crate::platform::cache_dir("tiles");
         tracing::info!("tile cache: {}", cache_dir.display());
         let ctx = cc.egui_ctx.clone();
         let tiles = TileService::new(cache_dir.clone(), move || ctx.request_repaint());
         let center = LngLat::new(-92.5, 38.5);
-        let dirs = ProjectDirs::from("org", "ShowMeFire", "Field");
-        let offline_dir = dirs
-            .as_ref()
-            .map(|d| d.data_local_dir().join("offline"))
-            .unwrap_or_else(|| std::env::temp_dir().join("smf-field-offline"));
-        let store = LayerStore::new(
-            dirs.as_ref()
-                .map(|d| d.config_dir().join("layers.json"))
-                .unwrap_or_else(|| std::env::temp_dir().join("smf-field-layers.json")),
-        );
+        let offline_dir = crate::platform::data_dir("offline");
+        let store = LayerStore::new();
         let mut panel = Self {
             sources: basemaps().into_iter().map(Arc::new).collect(),
             selected: 0,

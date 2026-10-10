@@ -11,7 +11,8 @@ use smf_geo::LngLat;
 use smf_w3w::{Line, Square, W3wClient, W3wError};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use web_time::Instant;
 
 /// The 3 m grid is unreadable below this 2D zoom (squares under ~6 px).
 const GRID_MIN_ZOOM: f64 = 18.0;

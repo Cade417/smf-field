@@ -3,6 +3,10 @@
 
 mod aprs;
 mod inreach;
+#[cfg(not(target_arch = "wasm32"))]
+mod sources;
+#[cfg(target_arch = "wasm32")]
+#[path = "sources_web.rs"]
 mod sources;
 
 pub use aprs::{aprs_filter, parse_aprs};

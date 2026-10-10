@@ -1,8 +1,10 @@
 // Draws raster tiles as screen-space quads. The CPU projects tile corners in f64
 // and sends pixel positions, so the GPU never sees huge Mercator coordinates.
 
+// Padded to 16 bytes: WebGL-based browsers require uniform structs to be 16-byte multiples.
 struct Globals {
     size: vec2<f32>,
+    pad: vec2<f32>,
 };
 
 @group(0) @binding(0) var<uniform> globals: Globals;

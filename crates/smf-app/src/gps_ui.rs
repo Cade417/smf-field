@@ -9,7 +9,8 @@ use smf_features::{Editor, Geometry};
 use smf_geo::{LngLat, bearing_deg, distance_m, format_distance, geodesic_circle};
 use smf_gps::{Event, Fix, Handle, Source};
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use web_time::Instant;
 
 const BLUE: Color32 = Color32::from_rgb(30, 110, 240);
 /// A fix older than this is shown as stale rather than as where you are now.
@@ -190,6 +191,7 @@ impl MapPanel {
             Kind::Replay => {
                 ui.horizontal(|ui| {
                     ui.text_edit_singleline(&mut g.replay);
+                    #[cfg(not(target_arch = "wasm32"))]
                     if ui.button("Browse...").clicked()
                         && let Some(p) = rfd::FileDialog::new().pick_file()
                     {

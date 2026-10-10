@@ -215,7 +215,7 @@ impl MapPanel {
                 if cancelled {
                     let _ = std::fs::remove_file(&tmp);
                     self.earth.job = None;
-                    self.notice = Some(("Export cancelled.".into(), std::time::Instant::now()));
+                    self.notice = Some(("Export cancelled.".into(), web_time::Instant::now()));
                     return;
                 }
                 let (tx, rx) = channel();
@@ -236,7 +236,7 @@ impl MapPanel {
                 Ok(n) => {
                     self.notice = Some((
                         format!("Exported {n} tiles to {}", out.display()),
-                        std::time::Instant::now(),
+                        web_time::Instant::now(),
                     ));
                 }
                 Err(e) => self.earth.error = Some(e),

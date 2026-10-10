@@ -4,7 +4,6 @@
 
 use crate::map_panel::{MapPanel, ViewMode};
 use crate::overlay::{self, Projector};
-use directories::ProjectDirs;
 use eframe::egui::{self, Rect};
 use smf_data::DataError;
 use smf_ext::{ExtClient, ExtFeature};
@@ -12,7 +11,7 @@ use smf_features::{GeoHit, geometry_hit};
 use smf_geo::LngLat;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::time::Instant;
+use web_time::Instant;
 
 /// Below these zooms the view covers too much ground for one request to be useful.
 const HISTORY_MIN_ZOOM: f64 = 7.0;
@@ -74,9 +73,7 @@ pub struct ExtState {
 
 impl ExtState {
     pub fn new() -> Self {
-        let cache_dir = ProjectDirs::from("org", "ShowMeFire", "Field")
-            .map(|d| d.cache_dir().join("ext"))
-            .unwrap_or_else(|| std::env::temp_dir().join("smf-field-ext"));
+        let cache_dir = crate::platform::cache_dir("ext");
         let (tx, rx) = channel();
         Self {
             history: Layer::default(),
@@ -224,7 +221,7 @@ impl MapPanel {
             l.inflight = true;
             let (tx, ctx) = (self.ext.tx.clone(), ctx.clone());
             let now = smf_data::unix_now();
-            let client = ExtClient::new(Some(cache_dir));
+            let client = ExtClient::new(Some(cache_dir).filter(|d| !d.as_os_str().is_empty()));
             let done = move |r: Result<Vec<ExtFeature>, DataError>| {
                 let _ = tx.send((k, bbox, zoom, r));
                 ctx.request_repaint();

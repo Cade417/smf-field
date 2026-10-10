@@ -220,30 +220,21 @@ fn host_of(url: &str) -> String {
         .to_owned()
 }
 
-/// Custom layers persisted as JSON in the config directory.
-pub struct LayerStore {
-    path: PathBuf,
-}
+/// Custom layers persisted as JSON in the settings store (`layers.json`).
+pub struct LayerStore;
 
 impl LayerStore {
-    pub fn new(path: PathBuf) -> Self {
-        Self { path }
+    pub fn new() -> Self {
+        Self
     }
 
     pub fn load(&self) -> Vec<TileSource> {
-        std::fs::read_to_string(&self.path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
+        crate::store::load_json("layers.json")
     }
 
     pub fn save(&self, layers: &[TileSource]) -> std::io::Result<()> {
-        if let Some(d) = self.path.parent() {
-            std::fs::create_dir_all(d)?;
-        }
-        let tmp = self.path.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_vec_pretty(layers)?)?;
-        std::fs::rename(tmp, &self.path)
+        crate::store::save_json("layers.json", &layers);
+        Ok(())
     }
 }
 
@@ -433,8 +424,9 @@ mod tests {
 
     #[test]
     fn layer_store_roundtrips_and_survives_corruption() {
-        let dir = tmp("store");
-        let store = LayerStore::new(dir.join("cfg").join("layers.json"));
+        // Storage is redirected to a temporary folder so real settings are never touched.
+        let dir = crate::store::use_temp_root("layers");
+        let store = LayerStore::new();
         assert!(store.load().is_empty(), "missing file is fine");
         let s = AddLayerInput {
             url: "https://a.org/{z}/{x}/{y}.png".into(),
@@ -450,7 +442,7 @@ mod tests {
             (back[0].id.as_str(), back[0].overlay),
             (s.id.as_str(), true)
         );
-        std::fs::write(dir.join("cfg").join("layers.json"), b"{ not json").unwrap();
+        crate::store::write("layers.json", "{ not json");
         assert!(
             store.load().is_empty(),
             "corrupt config must not crash the app"

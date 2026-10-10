@@ -11,4 +11,6 @@ workspace = true
 [dependencies]
 smf-ext.workspace = true
 roxmltree = "0.20"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls", "query"] }

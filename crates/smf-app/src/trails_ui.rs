@@ -25,7 +25,7 @@ pub struct TrailState {
     fetched: Option<([f64; 4], f64)>,
     inflight: bool,
     /// After a failed fetch, wait before asking again instead of hammering a busy server.
-    retry_at: Option<std::time::Instant>,
+    retry_at: Option<web_time::Instant>,
     pub status: Option<String>,
     /// Verification hook (SMF_TRAIL_ROUTE): draw a line through these points once trails load.
     pub dev_route: Option<Vec<LngLat>>,
@@ -98,13 +98,13 @@ impl MapPanel {
                 Err(e) => {
                     tracing::warn!("trails: {e}");
                     self.trails.status = Some(format!("{e}; retrying shortly."));
-                    self.trails.retry_at = Some(std::time::Instant::now() + RETRY);
+                    self.trails.retry_at = Some(web_time::Instant::now() + RETRY);
                 }
             }
         }
         if let Some(t) = self.trails.retry_at {
-            if t > std::time::Instant::now() {
-                ctx.request_repaint_after(t - std::time::Instant::now());
+            if t > web_time::Instant::now() {
+                ctx.request_repaint_after(t - web_time::Instant::now());
                 return;
             }
             self.trails.retry_at = None;

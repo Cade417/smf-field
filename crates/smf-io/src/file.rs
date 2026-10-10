@@ -102,6 +102,67 @@ pub fn import_path(path: &Path) -> Result<Imported, IoError> {
     }
 }
 
+/// Import from bytes already in memory (browsers have no file paths). The format comes from
+/// `name`'s extension. Shapefiles span several files and are only supported by `import_path`.
+pub fn import_bytes(name: &str, bytes: &[u8]) -> Result<Imported, IoError> {
+    let fmt = Format::from_path(Path::new(name)).ok_or_else(|| {
+        IoError::Format(format!(
+            "Don't know how to import \"{name}\" (supported: GeoJSON, GPX, KML, KMZ, CSV)."
+        ))
+    })?;
+    if bytes.len() as u64 > MAX_IMPORT_BYTES {
+        return Err(IoError::Format(format!(
+            "{name} is larger than the {} MB import limit",
+            MAX_IMPORT_BYTES / 1024 / 1024
+        )));
+    }
+    let bad = |what: &str, e: &dyn std::fmt::Display| {
+        IoError::Format(format!("{what} file is invalid: {e}"))
+    };
+    let text = || {
+        String::from_utf8(bytes.to_vec())
+            .map_err(|_| IoError::Format(format!("{name} is not UTF-8 text")))
+    };
+    match fmt {
+        Format::GeoJson => crate::read_geojson(&text()?).map_err(|e| bad("GeoJSON", &e)),
+        Format::Gpx => crate::read_gpx(&text()?).map_err(|e| bad("GPX", &e)),
+        Format::Kml => crate::read_kml(&text()?).map_err(|e| bad("KML", &e)),
+        Format::Kmz => crate::read_kmz(std::io::Cursor::new(bytes)),
+        Format::Csv => crate::read_csv(&text()?),
+        Format::Shapefile => Err(IoError::Format(
+            "Shapefiles are made of several files; import them in the desktop app.".into(),
+        )),
+    }
+}
+
+/// Export to bytes (for browsers, which download the result). Returns the file content and
+/// any notes about data that could not be represented. Shapefiles need several files and are
+/// only supported by `export_path`.
+pub fn export_bytes(project: &Project, fmt: Format) -> Result<(Vec<u8>, Vec<String>), IoError> {
+    Ok(match fmt {
+        Format::GeoJson => (crate::write_geojson(project).into_bytes(), vec![]),
+        Format::Gpx => {
+            let (text, w) = crate::write_gpx(project);
+            (text.into_bytes(), w)
+        }
+        Format::Kml => (crate::write_kml(project).into_bytes(), vec![]),
+        Format::Kmz => {
+            let mut buf = std::io::Cursor::new(Vec::new());
+            crate::write_kmz(project, &mut buf)?;
+            (buf.into_inner(), vec![])
+        }
+        Format::Csv => {
+            let (text, w) = crate::write_csv(project);
+            (text.into_bytes(), w)
+        }
+        Format::Shapefile => {
+            return Err(IoError::Format(
+                "Shapefiles are made of several files; export them from the desktop app.".into(),
+            ));
+        }
+    })
+}
+
 #[derive(Debug, Default)]
 pub struct ExportReport {
     pub files: Vec<PathBuf>,
@@ -225,5 +286,32 @@ mod tests {
             Some(Format::GeoJson)
         );
         assert_eq!(Format::from_path(Path::new("noext")), None);
+    }
+
+    #[test]
+    fn bytes_import_and_export_round_trip() {
+        let p = project();
+        for fmt in [
+            Format::GeoJson,
+            Format::Gpx,
+            Format::Kml,
+            Format::Kmz,
+            Format::Csv,
+        ] {
+            let (bytes, _warn) = export_bytes(&p, fmt).unwrap();
+            let imp = import_bytes(&format!("out.{}", fmt.extension()), &bytes).unwrap();
+            assert!(
+                !imp.features.is_empty(),
+                "{fmt:?} round trip lost everything"
+            );
+        }
+        let err = import_bytes("x.shp", b"").unwrap_err().to_string();
+        assert!(err.contains("desktop"), "{err}");
+        assert!(export_bytes(&p, Format::Shapefile).is_err());
+        assert!(import_bytes("mystery.xyz", b"data").is_err());
+        assert!(
+            import_bytes("bad.geojson", &[0xFF, 0xFE]).is_err(),
+            "not UTF-8 is refused"
+        );
     }
 }

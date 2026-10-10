@@ -15,9 +15,13 @@ serde_json.workspace = true
 toml.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-crossbeam-channel = "0.5"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+smf-net.workspace = true
+web-time = "1"
+utm = "0.1"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+crossbeam-channel = "0.5"
 rusqlite = { version = "0.40", features = ["bundled"] }
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
 tiff = "0.11.3"
-utm = "0.1"

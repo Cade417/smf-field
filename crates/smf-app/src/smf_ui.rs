@@ -5,7 +5,6 @@ use crate::layers_ui::OverlayLayer;
 use crate::map_panel::MapPanel;
 use crate::overlay::Projector;
 use crossbeam_channel::{Receiver, Sender, unbounded};
-use directories::ProjectDirs;
 use eframe::egui::{self, Align2, Color32, Pos2, Rect, RichText, Stroke, Vec2};
 use serde::{Deserialize, Serialize};
 use smf_data::{
@@ -81,13 +80,7 @@ pub struct SmfState {
 
 impl SmfState {
     pub fn new(ctx: &egui::Context) -> Self {
-        #[cfg(not(target_arch = "wasm32"))]
-        let cache_dir = ProjectDirs::from("org", "ShowMeFire", "Field")
-            .map(|d| d.cache_dir().join("smf-data"))
-            .unwrap_or_else(|| std::env::temp_dir().join("smf-field-data"));
-        // Browsers have no folders; the data cache is simply not kept there.
-        #[cfg(target_arch = "wasm32")]
-        let cache_dir = PathBuf::new();
+        let cache_dir = crate::platform::cache_dir("smf-data");
         let mut prefs: Prefs = crate::store::load_json("smf_prefs.json");
         if !prefs.initialized {
             // First run: show the incident picture and the fire-danger raster without any setup.
@@ -695,7 +688,7 @@ impl MapPanel {
                 ui.separator();
                 for (label, url) in links(&f, &self.smf.base) {
                     if ui.link(&label).on_hover_text(&url).clicked() {
-                        let _ = open::that(&url);
+                        crate::platform::open_url(&url);
                     }
                 }
                 if ui

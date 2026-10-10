@@ -1,5 +1,9 @@
 //! ShowMeFire Field desktop entry point.
 
+#[cfg(not(target_arch = "wasm32"))]
+mod earth_ui;
+#[cfg(target_arch = "wasm32")]
+#[path = "earth_ui_web.rs"]
 mod earth_ui;
 mod ext_ui;
 mod gps_ui;
@@ -9,11 +13,20 @@ mod live_ui;
 mod map_panel;
 mod overlay;
 mod panels;
+mod platform;
+#[cfg(not(target_arch = "wasm32"))]
+mod print_ui;
+#[cfg(target_arch = "wasm32")]
+#[path = "print_ui_web.rs"]
 mod print_ui;
 mod smf_ui;
 mod store;
 mod team_ui;
 mod trails_ui;
+#[cfg(not(target_arch = "wasm32"))]
+mod update;
+#[cfg(target_arch = "wasm32")]
+#[path = "update_web.rs"]
 mod update;
 mod w3w_ui;
 
@@ -21,7 +34,9 @@ use eframe::egui;
 use smf_features::{Editor, Geometry, Project, SavedView, Tool};
 use smf_geo::LngLat;
 use std::path::PathBuf;
+use web_time::Instant;
 
+#[cfg(not(target_arch = "wasm32"))]
 fn main() -> eframe::Result {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -44,19 +59,57 @@ fn main() -> eframe::Result {
     )
 }
 
+/// In the browser the app starts from the page's `<canvas id="smf_canvas">`.
+#[cfg(target_arch = "wasm32")]
+fn main() {
+    use eframe::wasm_bindgen::JsCast as _;
+    console_error_panic_hook::set_once();
+    tracing_wasm::set_as_global_default();
+    wasm_bindgen_futures::spawn_local(async {
+        let document = web_sys::window()
+            .and_then(|w| w.document())
+            .expect("no document");
+        let canvas = document
+            .get_element_by_id("smf_canvas")
+            .expect("the page must contain <canvas id=\"smf_canvas\">")
+            .dyn_into::<web_sys::HtmlCanvasElement>()
+            .expect("smf_canvas is not a canvas");
+        let options = eframe::WebOptions::default();
+        let result = eframe::WebRunner::new()
+            .start(
+                canvas,
+                options,
+                Box::new(|cc| Ok(Box::new(FieldApp::new(cc)))),
+            )
+            .await;
+        // Hide the loading text, or show why the app could not start.
+        if let Some(el) = document.get_element_by_id("loading_text") {
+            match result {
+                Ok(()) => el.remove(),
+                Err(e) => el.set_inner_html(&format!(
+                    "The map could not start in this browser: {e:?}. Try an up-to-date Chrome, Edge, Firefox or Safari."
+                )),
+            }
+        }
+    });
+}
+
 struct FieldApp {
+    /// For asking the page for files and repainting after asynchronous results.
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    ctx: egui::Context,
     map: map_panel::MapPanel,
     editor: Editor,
     path: Option<PathBuf>,
     /// `editor.revision` at the last save/load; differs when there are unsaved edits.
     saved_revision: u64,
-    status: Option<(String, std::time::Instant)>,
+    status: Option<(String, Instant)>,
     title: String,
     shot: Option<ScreenshotHook>,
     /// SMF_PRINT / SMF_GEOTIFF: close the app when the print job ends.
     exit_on_print: bool,
     /// Deferred SMF_PRINT request: (path, scale, dpi, when).
-    pending_print: Option<(PathBuf, f64, u32, std::time::Instant)>,
+    pending_print: Option<(PathBuf, f64, u32, Instant)>,
     /// Automated run: never open modal dialogs.
     quiet: bool,
     about_open: bool,
@@ -68,16 +121,17 @@ struct FieldApp {
 /// captured) and exits. SMF_SCREENSHOT_SECS overrides the 12 s settle time.
 struct ScreenshotHook {
     path: PathBuf,
-    started: std::time::Instant,
+    started: Instant,
     settle: std::time::Duration,
     requested: bool,
 }
 
 impl FieldApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        // Environment hooks are for desktop development and verification; the web app has none.
         let shot = std::env::var_os("SMF_SCREENSHOT").map(|p| ScreenshotHook {
             path: p.into(),
-            started: std::time::Instant::now(),
+            started: Instant::now(),
             settle: std::time::Duration::from_secs(
                 std::env::var("SMF_SCREENSHOT_SECS")
                     .ok()
@@ -87,6 +141,7 @@ impl FieldApp {
             requested: false,
         });
         let mut app = Self {
+            ctx: cc.egui_ctx.clone(),
             map: map_panel::MapPanel::new(cc),
             editor: Editor::default(),
             path: None,
@@ -104,17 +159,21 @@ impl FieldApp {
             about_open: std::env::var_os("SMF_ABOUT").is_some(),
             update: std::sync::Arc::new(std::sync::Mutex::new(update::UpdateState::Idle)),
         };
-        if let Some(p) = std::env::var_os("SMF_OPEN") {
-            app.open_path(p.into());
-        } else if std::env::var_os("SMF_DEMO").is_some() {
-            app.load_demo();
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if let Some(p) = std::env::var_os("SMF_OPEN") {
+                app.open_path(p.into());
+            } else if std::env::var_os("SMF_DEMO").is_some() {
+                app.load_demo();
+            }
+            app.apply_dev_env();
         }
-        app.apply_dev_env();
         app
     }
 
     /// Verification hooks. SMF_CAM="lng,lat,distance_m,pitch_deg,heading_deg" starts in 3D at that
     /// camera; SMF_SLOPE=deg|fire turns on slope shading; SMF_SELECT=<feature name> selects it; SMF_IMPORT=a;b imports files at startup; SMF_VIEW=lng,lat,zoom; SMF_DOWNLOAD=lng,lat,span,zmin,zmax,name; SMF_OFFLINE=1; SMF_BASEMAP=id; SMF_INFO=<layer id>; SMF_COND=lng,lat; SMF_EARTH=out.kmz[,max_zoom,levels]; SMF_GPS=system|serial:COM3,4800|gpsd:host:port|replay:file,ms; SMF_GPS_RECORD=1; SMF_LIVE=aprs:area:lat,lng,km|inreach:name[,pw]; SMF_TEAM=url|code|name[|map name]; SMF_EXT=history,snow; SMF_TRAIL_ROUTE=lng,lat;lng,lat;... (+SMF_TRAILS_FILE=overpass.json); SMF_W3W_SEARCH=a.b.c; SMF_W3W_GRID=1; SMF_W3W_HOVER=lng,lat (all need W3W_API_KEY; SMF_W3W_BASE=<url> points at a mock); SMF_FORECAST=<lead hours>; SMF_API_BASE=<url>; SMF_LAYER=file[@opacity]; SMF_PRINT=out.pdf[,scale,dpi] (+SMF_PRINT_DELAY secs); SMF_GEOTIFF=out.tif[,zoom,half_span_deg].
+    #[cfg(not(target_arch = "wasm32"))]
     fn apply_dev_env(&mut self) {
         if let Ok(v) = std::env::var("SMF_CAM") {
             let n: Vec<f64> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
@@ -183,7 +242,7 @@ impl FieldApp {
                 PathBuf::from(p[0]),
                 scale,
                 dpi,
-                std::time::Instant::now() + std::time::Duration::from_secs_f64(delay),
+                Instant::now() + std::time::Duration::from_secs_f64(delay),
             ));
         }
         if let Ok(v) = std::env::var("SMF_GEOTIFF") {
@@ -347,10 +406,11 @@ impl FieldApp {
     }
 
     fn say(&mut self, msg: impl Into<String>) {
-        self.status = Some((msg.into(), std::time::Instant::now()));
+        self.status = Some((msg.into(), Instant::now()));
     }
 
     /// Sample data so the drawing overlay can be verified without clicking (SMF_DEMO=1).
+    #[cfg(not(target_arch = "wasm32"))]
     fn load_demo(&mut self) {
         let e = &mut self.editor;
         let c = LngLat::new(-92.30, 38.58);
@@ -417,14 +477,40 @@ impl FieldApp {
         // Automated runs have nobody to ask, and must not hang on a modal dialog.
         !self.dirty()
             || self.quiet
-            || rfd::MessageDialog::new()
-                .set_title("Unsaved changes")
-                .set_description("Discard unsaved changes to this map?")
-                .set_buttons(rfd::MessageButtons::YesNo)
-                .show()
-                == rfd::MessageDialogResult::Yes
+            || platform::confirm("Unsaved changes", "Discard unsaved changes to this map?")
     }
 
+    /// Make `project` the current map (after opening a file) and frame it.
+    fn adopt_project(&mut self, project: Project) {
+        let view = project.view;
+        let bounds = project.bounds();
+        if let Some(b) = project.basemap.clone() {
+            self.map.set_basemap(&b);
+        }
+        self.editor.replace_project(project);
+        self.saved_revision = self.editor.revision;
+        match (view, bounds) {
+            (Some(v), _) => {
+                self.map.view.center = v.center;
+                self.map.view.zoom = v.zoom;
+                self.map.view.angle = v.angle;
+            }
+            (None, Some(b)) => self.map.pending_fit = Some(b),
+            _ => {}
+        }
+    }
+
+    /// Record what the user was looking at, so reopening lands in the same place.
+    fn remember_view(&mut self) {
+        self.editor.project.view = Some(SavedView {
+            center: self.map.view.center,
+            zoom: self.map.view.zoom,
+            angle: self.map.view.angle,
+        });
+        self.editor.project.basemap = Some(self.map.basemap_id().to_owned());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     fn open_dialog(&mut self) {
         if !self.confirm_discard() {
             return;
@@ -437,25 +523,23 @@ impl FieldApp {
         }
     }
 
+    #[cfg(target_arch = "wasm32")]
+    fn open_dialog(&mut self) {
+        if self.confirm_discard() {
+            platform::pick_files(
+                &self.ctx,
+                platform::PickKind::OpenMap,
+                "ShowMeFire map",
+                &["smfmap"],
+            );
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     fn open_path(&mut self, p: PathBuf) {
         match smf_io::load_project(&p) {
             Ok(project) => {
-                let view = project.view;
-                let bounds = project.bounds();
-                if let Some(b) = project.basemap.clone() {
-                    self.map.set_basemap(&b);
-                }
-                self.editor.replace_project(project);
-                self.saved_revision = self.editor.revision;
-                match (view, bounds) {
-                    (Some(v), _) => {
-                        self.map.view.center = v.center;
-                        self.map.view.zoom = v.zoom;
-                        self.map.view.angle = v.angle;
-                    }
-                    (None, Some(b)) => self.map.pending_fit = Some(b),
-                    _ => {}
-                }
+                self.adopt_project(project);
                 self.say(format!("Opened {}", p.display()));
                 self.path = Some(p);
             }
@@ -465,6 +549,19 @@ impl FieldApp {
         }
     }
 
+    /// A map file chosen in the browser.
+    #[cfg(target_arch = "wasm32")]
+    fn open_bytes(&mut self, name: &str, bytes: Vec<u8>) {
+        match smf_io::read_project(std::io::Cursor::new(bytes)) {
+            Ok(project) => {
+                self.adopt_project(project);
+                self.say(format!("Opened {name}"));
+            }
+            Err(e) => alert(self.quiet, "Could not open map", e.to_string()),
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     fn save(&mut self, as_new: bool) {
         let path = match (&self.path, as_new) {
             (Some(p), false) => p.clone(),
@@ -479,13 +576,7 @@ impl FieldApp {
                 p
             }
         };
-        // Persist what the user was looking at so reopening lands in the same place.
-        self.editor.project.view = Some(SavedView {
-            center: self.map.view.center,
-            zoom: self.map.view.zoom,
-            angle: self.map.view.angle,
-        });
-        self.editor.project.basemap = Some(self.map.basemap_id().to_owned());
+        self.remember_view();
         match smf_io::save_project(&self.editor.project, &path) {
             Ok(()) => {
                 self.saved_revision = self.editor.revision;
@@ -495,6 +586,26 @@ impl FieldApp {
             Err(e) => {
                 alert(self.quiet, "Could not save map", e.to_string());
             }
+        }
+    }
+
+    /// Browsers cannot write to a chosen file, so saving downloads a copy.
+    #[cfg(target_arch = "wasm32")]
+    fn save(&mut self, _as_new: bool) {
+        self.remember_view();
+        let mut buf = std::io::Cursor::new(Vec::new());
+        match smf_io::write_project(&self.editor.project, &mut buf) {
+            Ok(()) => {
+                let name = format!("{}.smfmap", file_stem(&self.editor.project.name));
+                match platform::download_bytes(&name, "application/zip", buf.get_ref()) {
+                    Ok(()) => {
+                        self.saved_revision = self.editor.revision;
+                        self.say(format!("Downloaded {name}"));
+                    }
+                    Err(e) => alert(self.quiet, "Could not save map", e),
+                }
+            }
+            Err(e) => alert(self.quiet, "Could not save map", e.to_string()),
         }
     }
 
@@ -632,6 +743,7 @@ impl FieldApp {
         });
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn import_dialog(&mut self) {
         let files = rfd::FileDialog::new()
             .add_filter("Map data", smf_io::IMPORT_EXTENSIONS)
@@ -641,19 +753,39 @@ impl FieldApp {
         }
     }
 
+    #[cfg(target_arch = "wasm32")]
+    fn import_dialog(&mut self) {
+        platform::pick_files(
+            &self.ctx,
+            platform::PickKind::Import,
+            "Map data",
+            smf_io::IMPORT_EXTENSIONS,
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     fn import_file(&mut self, path: PathBuf) {
         let name = path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        match smf_io::import_path(&path) {
+        let result = smf_io::import_path(&path);
+        self.import_result(&name, result);
+    }
+
+    /// A data file chosen or dropped in the browser.
+    #[cfg(target_arch = "wasm32")]
+    fn import_bytes_file(&mut self, name: &str, bytes: &[u8]) {
+        let result = smf_io::import_bytes(name, bytes);
+        self.import_result(name, result);
+    }
+
+    fn import_result(&mut self, name: &str, result: Result<smf_io::Imported, smf_io::IoError>) {
+        match result {
             Ok(imp) if imp.features.is_empty() => {
                 let mut msg = format!("{name} contained no features I can show.");
                 for w in &imp.warnings {
-                    msg.push_str(&format!(
-                        "
-- {w}"
-                    ));
+                    msg.push_str(&format!("\n- {w}"));
                 }
                 alert(self.quiet, "Nothing imported", msg);
             }
@@ -688,20 +820,9 @@ impl FieldApp {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn export_dialog(&mut self, fmt: smf_io::Format) {
-        let stem: String = self
-            .editor
-            .project
-            .name
-            .chars()
-            .map(|c| {
-                if c.is_alphanumeric() || matches!(c, ' ' | '-' | '_') {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
+        let stem = file_stem(&self.editor.project.name);
         let ext = fmt.extension();
         let Some(path) = rfd::FileDialog::new()
             .add_filter(fmt.label(), &[ext])
@@ -724,6 +845,30 @@ impl FieldApp {
             Err(e) => {
                 alert(self.quiet, "Could not export", e.to_string());
             }
+        }
+    }
+
+    /// Browsers cannot write to a chosen file, so exporting downloads the result.
+    #[cfg(target_arch = "wasm32")]
+    fn export_dialog(&mut self, fmt: smf_io::Format) {
+        let name = format!(
+            "{}.{}",
+            file_stem(&self.editor.project.name),
+            fmt.extension()
+        );
+        match smf_io::export_bytes(&self.editor.project, fmt) {
+            Ok((bytes, warnings)) => {
+                match platform::download_bytes(&name, "application/octet-stream", &bytes) {
+                    Ok(()) => {
+                        self.say(format!("Downloaded {name}"));
+                        if !warnings.is_empty() {
+                            notify_warnings(self.quiet, "Exported with notes", &warnings);
+                        }
+                    }
+                    Err(e) => alert(self.quiet, "Could not export", e),
+                }
+            }
+            Err(e) => alert(self.quiet, "Could not export", e.to_string()),
         }
     }
 
@@ -791,7 +936,7 @@ impl FieldApp {
                         ui.label(&r.notes);
                     }
                     if ui.link("Open download page").clicked() {
-                        let _ = open::that(&r.url);
+                        platform::open_url(&r.url);
                     }
                 }
                 update::UpdateState::Failed(e) => {
@@ -828,21 +973,44 @@ impl eframe::App for FieldApp {
         }
         self.update_title(&ctx);
         self.about_window(&ctx);
-        let dropped: Vec<PathBuf> = ctx.input(|i| {
-            i.raw
-                .dropped_files
-                .iter()
-                .map(|f| f.path().to_path_buf())
-                .collect()
-        });
-        for p in dropped {
-            self.import_file(p);
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let dropped: Vec<PathBuf> = ctx.input(|i| {
+                i.raw
+                    .dropped_files
+                    .iter()
+                    .map(|f| f.path().to_path_buf())
+                    .collect()
+            });
+            for p in dropped {
+                self.import_file(p);
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let dropped: Vec<egui::DroppedFileHandle> =
+                ctx.input(|i| i.raw.dropped_files.iter().cloned().collect());
+            if !dropped.is_empty() {
+                platform::read_dropped(&ctx, dropped);
+            }
+            for ev in platform::take_events() {
+                match ev {
+                    platform::PlatformEvent::OpenMap { name, bytes } => {
+                        self.open_bytes(&name, bytes)
+                    }
+                    platform::PlatformEvent::Import { name, bytes } => {
+                        self.import_bytes_file(&name, &bytes)
+                    }
+                    platform::PlatformEvent::Message(m) => alert(self.quiet, "File problem", m),
+                }
+            }
         }
         self.menu(ui);
         self.map.show(ui, &mut self.editor);
         self.screenshot_hook(&ctx);
+        #[cfg(not(target_arch = "wasm32"))]
         if let Some((path, scale, dpi, when)) = self.pending_print.clone() {
-            if std::time::Instant::now() >= when {
+            if Instant::now() >= when {
                 self.pending_print = None;
                 self.map.dev_print(
                     &self.editor,
@@ -926,6 +1094,19 @@ fn bounds_of(editor: &Editor, ids: &[u64]) -> Option<[f64; 4]> {
     })
 }
 
+/// A file-name-safe version of the map's name.
+fn file_stem(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_alphanumeric() || matches!(c, ' ' | '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 fn notify_warnings(quiet: bool, title: &str, warnings: &[String]) {
     let mut msg = String::new();
     for w in warnings.iter().take(12) {
@@ -951,9 +1132,6 @@ fn alert(quiet: bool, title: &str, msg: impl Into<String>) {
     if quiet {
         tracing::warn!("{title}: {msg}");
     } else {
-        rfd::MessageDialog::new()
-            .set_title(title)
-            .set_description(msg)
-            .show();
+        platform::message(title, &msg);
     }
 }

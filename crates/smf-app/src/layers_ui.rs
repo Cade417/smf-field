@@ -9,7 +9,7 @@ use smf_features::Editor;
 use smf_geo::LngLat;
 use smf_tiles::{Backend, Download, DownloadError, TileSource, estimate};
 use std::sync::atomic::Ordering;
-use std::time::Instant;
+use web_time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct OverlayLayer {
@@ -467,6 +467,7 @@ impl MapPanel {
                 LayerKind::Mbtiles | LayerKind::Geotiff => {
                     ui.horizontal(|ui| {
                         ui.add(egui::TextEdit::singleline(&mut input.path).desired_width(300.0));
+                        #[cfg(not(target_arch = "wasm32"))]
                         if ui.button("Browse…").clicked() {
                             let (label, exts): (&str, &[&str]) =
                                 if input.kind == LayerKind::Mbtiles { ("MBTiles", &["mbtiles"]) } else { ("GeoTIFF", &["tif", "tiff"]) };
