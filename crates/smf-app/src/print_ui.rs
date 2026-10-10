@@ -152,6 +152,7 @@ impl MapPanel {
             .map(|o| LegendOverlay {
                 name: self.sources[o.source].name.clone(),
                 opacity: o.opacity,
+                color: None,
             })
             .collect()
     }
@@ -198,8 +199,20 @@ impl MapPanel {
         let mut spec = self.print.spec.clone();
         spec.declination_deg = self.print.declination_on.then_some(self.print.declination);
         spec.attribution = self.print_attribution();
-        let legend = self.legend_overlays();
+        let mut legend = self.legend_overlays();
+        // Live Show Me Fire data on screen goes on the page too: drawn beneath the user's markup, with one
+        // legend line per layer (not one per incident).
         let project = editor.project.clone();
+        let extra = self.smf_print_features();
+        legend.extend(
+            self.smf_print_legend()
+                .into_iter()
+                .map(|(name, n, color)| LegendOverlay {
+                    name: format!("{name} ({n})"),
+                    opacity: 1.0,
+                    color: Some(color),
+                }),
+        );
         let (kind, zoom) = (self.print.kind, self.print.geotiff_zoom);
         std::thread::spawn(move || {
             let mut renderer = MapRenderer::new(&device, &queue);
@@ -225,6 +238,7 @@ impl MapPanel {
                     &spec,
                     &layers,
                     &project,
+                    &extra,
                     &legend,
                     &mut progress,
                     &cancel,
@@ -658,13 +672,8 @@ impl MapPanel {
                 }
             });
         if let Some(p) = open_path {
-            #[cfg(windows)]
-            let _ = std::process::Command::new("cmd")
-                .args(["/C", "start", ""])
-                .arg(&p)
-                .spawn();
-            #[cfg(not(windows))]
-            let _ = p;
+            // ShellExecute via the `open` crate: no shell is involved, so file names can't inject commands.
+            let _ = open::that(&p);
         }
         if dismiss {
             self.print.job = None;

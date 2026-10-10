@@ -207,6 +207,7 @@ impl AddLayerInput {
             },
             // Local files are already offline; network layers need the user to assert they may be downloaded.
             offline_allowed: !local && self.offline_allowed,
+            max_age_secs: None,
         })
     }
 }

@@ -1,0 +1,28 @@
+name: release
+# Builds the optimized app on all three platforms and attaches the binaries to a tagged release.
+# Installers (MSI/dmg/AppImage via cargo-packager, see [package.metadata.packager] in
+# crates/smf-app/Cargo.toml) and code signing are NOT produced here yet.
+on:
+  push:
+    tags: ["v*"]
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - { os: windows-latest, bin: smf-field.exe, name: windows-x64 }
+          - { os: macos-latest, bin: smf-field, name: macos-arm64 }
+          - { os: ubuntu-latest, bin: smf-field, name: linux-x64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libwayland-dev libxkbcommon-dev libx11-dev libxcb1-dev
+      - run: cargo test --workspace --release
+      - run: cargo build --release -p smf-app
+      - uses: actions/upload-artifact@v4
+        with:
+          name: smf-field-${{ matrix.name }}
+          path: target/release/${{ matrix.bin }}

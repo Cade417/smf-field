@@ -318,20 +318,31 @@ fn load_tile(
         }
     }
     let cache = open_cache(caches, cache_dir, &source.id);
-    let bytes = cache.as_ref().and_then(|c| c.get(id)).or_else(|| {
-        if shared.offline.load(Ordering::Relaxed) {
-            return None;
-        }
+    let fetch = |cache: &Option<Arc<DiskCache>>| -> Option<Vec<u8>> {
         let url = source.tile_url(id);
         let resp = client.get(&url).send().ok()?.error_for_status().ok()?;
         let b = resp.bytes().ok()?.to_vec();
         // Only cache bytes that decode, so a captive-portal HTML page can't poison the cache.
         decode(&b)?;
-        if let Some(c) = &cache {
+        if let Some(c) = cache {
             c.put(id, &b);
         }
         Some(b)
-    });
+    };
+    let offline = shared.offline.load(Ordering::Relaxed);
+    let bytes = match cache.as_ref().and_then(|c| c.get_with_age(id)) {
+        // Live-data layers expire: refresh when old, but a stale tile beats no tile (offline, server down).
+        Some((stale, age)) if source.max_age_secs.is_some_and(|max| age > max) => {
+            if offline {
+                Some(stale)
+            } else {
+                fetch(&cache).or(Some(stale))
+            }
+        }
+        Some((fresh, _)) => Some(fresh),
+        None if offline => None,
+        None => fetch(&cache),
+    };
     bytes.and_then(|b| decode(&b))
 }
 
@@ -370,6 +381,7 @@ mod tests {
             max_zoom: 10,
             attribution: String::new(),
             offline_allowed: true,
+            max_age_secs: None,
         })
     }
 
@@ -463,6 +475,114 @@ mod tests {
             vec![missing],
             "uncached tile fails fast instead of hitting the network"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn png_color(c: [u8; 3]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        image::RgbaImage::from_pixel(256, 256, image::Rgba([c[0], c[1], c[2], 255]))
+            .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+            .unwrap();
+        buf
+    }
+
+    /// Multi-connection HTTP server returning a fixed PNG; counts requests.
+    fn serve_png(body: Vec<u8>) -> (u16, Arc<std::sync::atomic::AtomicUsize>, Arc<AtomicBool>) {
+        use std::sync::atomic::AtomicUsize;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (h, s) = (hits.clone(), stop.clone());
+        std::thread::spawn(move || {
+            while !s.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut sock, _)) => {
+                        let (h, body) = (h.clone(), body.clone());
+                        std::thread::spawn(move || {
+                            sock.set_nonblocking(false).unwrap();
+                            let mut buf = [0u8; 2048];
+                            let _ = sock.read(&mut buf);
+                            h.fetch_add(1, Ordering::Relaxed);
+                            let _ = write!(
+                                sock,
+                                "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                body.len()
+                            );
+                            let _ = sock.write_all(&body);
+                        });
+                    }
+                    Err(_) => std::thread::sleep(Duration::from_millis(5)),
+                }
+            }
+        });
+        (port, hits, stop)
+    }
+
+    fn first_pixel(e: Option<TileEvent>) -> [u8; 3] {
+        match e {
+            Some(TileEvent::Ready { rgba, .. }) => [rgba[0], rgba[1], rgba[2]],
+            _ => panic!("expected a tile"),
+        }
+    }
+
+    #[test]
+    fn live_layer_tiles_expire_but_stale_beats_nothing() {
+        let (port, hits, stop) = serve_png(png_color([0, 0, 255])); // fresh data from the server is blue
+        let dir = tmp("ttl");
+        let svc = TileService::new(dir.clone(), || {});
+        let mut src = (*source(format!("http://127.0.0.1:{port}/{{z}}/{{x}}/{{y}}"))).clone();
+        src.max_age_secs = Some(60);
+        let src = Arc::new(src);
+        let id = TileId::new(3, 2, 2);
+        let cache = svc.cache_for("t");
+        cache.put(id, &png_color([255, 0, 0])); // old cached tile is red
+        let ask = |svc: &TileService| {
+            svc.begin_frame();
+            svc.request(&src, id, 0.0);
+            wait(svc)
+        };
+        // Fresh (age 0 < 60 s): served from cache, server untouched.
+        assert_eq!(first_pixel(ask(&svc)), [255, 0, 0]);
+        assert_eq!(hits.load(Ordering::Relaxed), 0);
+        // Expired: refetched from the server and the cache is updated.
+        cache.backdate_all(3600);
+        assert_eq!(first_pixel(ask(&svc)), [0, 0, 255]);
+        assert_eq!(hits.load(Ordering::Relaxed), 1);
+        assert!(
+            cache.get_with_age(id).unwrap().1 < 5,
+            "cache entry was refreshed"
+        );
+        // Expired but offline: the stale tile is used rather than showing nothing.
+        cache.put(id, &png_color([255, 0, 0]));
+        cache.backdate_all(3600);
+        svc.set_offline(true);
+        assert_eq!(first_pixel(ask(&svc)), [255, 0, 0]);
+        assert_eq!(
+            hits.load(Ordering::Relaxed),
+            1,
+            "offline never touches the network"
+        );
+        // Expired with the server down: also falls back to the stale tile.
+        svc.set_offline(false);
+        stop.store(true, Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(60));
+        cache.backdate_all(3600);
+        let dead = Arc::new(TileSource {
+            url: "http://127.0.0.1:9/{z}/{x}/{y}".into(),
+            ..(*src).clone()
+        });
+        svc.begin_frame();
+        svc.request(&dead, id, 0.0);
+        assert_eq!(first_pixel(wait(&svc)), [255, 0, 0]);
+        // A source without max_age never expires.
+        let mut forever = (*dead).clone();
+        forever.max_age_secs = None;
+        cache.backdate_all(10_000_000);
+        svc.begin_frame();
+        svc.request(&Arc::new(forever), id, 0.0);
+        assert_eq!(first_pixel(wait(&svc)), [255, 0, 0]);
         let _ = std::fs::remove_dir_all(dir);
     }
 

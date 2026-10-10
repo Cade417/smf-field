@@ -7,3 +7,6 @@
 - Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`.
 - eframe 0.36 API: `App::ui(&mut Ui, &mut Frame)`, `CentralPanel::show(ui, ..)`.
 - Visual check without grabbing the screen: `SMF_SCREENSHOT=out.png cargo run -p smf-app` saves the app's own frame after `SMF_SCREENSHOT_SECS` (default 12) and exits. Never use OS screen capture; it records the user's other windows.
+- Tooling gotcha: tool inputs collapse `\` to `\`. Never type double backslashes in bash/python snippets; build backslashes with chr(92) or use the Write/Edit tools for Rust source containing escapes.
+- rustfmt reflows code, so scripted edits must match formatted text; prefer the Edit tool for call sites.
+- Legend swatches, grid labels and the footer are laid out in `smf-print/src/compose.rs`; the print accuracy tests live in `layout.rs` and `raster.rs`.

@@ -1,0 +1,135 @@
+{
+ "type": "FeatureCollection",
+ "features": [
+  {
+   "type": "Feature",
+   "geometry": {
+    "type": "Polygon",
+    "coordinates": [
+     [
+      [
+       -93.84993,
+       38.053472
+      ],
+      [
+       -93.841805,
+       38.026875
+      ],
+      [
+       -93.815695,
+       38.025903
+      ],
+      [
+       -93.823889,
+       38.0525
+      ],
+      [
+       -93.84993,
+       38.053472
+      ]
+     ]
+    ]
+   },
+   "properties": {
+    "SOURCE": "SHOWMEFIRE_STORE",
+    "EVENT_ID": 1048313,
+    "INCIDENT_ID": 2670,
+    "TYPENAME": "ngfs",
+    "ACQ_DATE_TIME": "2026-10-10T01:41:18.000000Z",
+    "FRP": 0.39,
+    "BRIGHT_T7": 290.85,
+    "CONFIDENCE": "nominal",
+    "SATELLITE": "GOES-19",
+    "DETECTION_CONFIDENCE_PCT": 35.0
+   }
+  },
+  {
+   "type": "Feature",
+   "geometry": {
+    "type": "Polygon",
+    "coordinates": [
+     [
+      [
+       -93.84993,
+       38.053472
+      ],
+      [
+       -93.841805,
+       38.026875
+      ],
+      [
+       -93.815695,
+       38.025903
+      ],
+      [
+       -93.823889,
+       38.0525
+      ],
+      [
+       -93.84993,
+       38.053472
+      ]
+     ]
+    ]
+   },
+   "properties": {
+    "SOURCE": "SHOWMEFIRE_STORE",
+    "EVENT_ID": 1048312,
+    "INCIDENT_ID": 2670,
+    "TYPENAME": "ngfs",
+    "ACQ_DATE_TIME": "2026-10-10T01:36:18.000000Z",
+    "FRP": 0.76,
+    "BRIGHT_T7": 290.97,
+    "CONFIDENCE": "nominal",
+    "SATELLITE": "GOES-19",
+    "DETECTION_CONFIDENCE_PCT": 36.0
+   }
+  },
+  {
+   "type": "Feature",
+   "geometry": {
+    "type": "Polygon",
+    "coordinates": [
+     [
+      [
+       -93.84993,
+       38.053472
+      ],
+      [
+       -93.841805,
+       38.026875
+      ],
+      [
+       -93.815695,
+       38.025903
+      ],
+      [
+       -93.823889,
+       38.0525
+      ],
+      [
+       -93.84993,
+       38.053472
+      ]
+     ]
+    ]
+   },
+   "properties": {
+    "SOURCE": "SHOWMEFIRE_STORE",
+    "EVENT_ID": 1048311,
+    "INCIDENT_ID": 2670,
+    "TYPENAME": "ngfs",
+    "ACQ_DATE_TIME": "2026-10-10T01:31:18.000000Z",
+    "FRP": 0.53,
+    "BRIGHT_T7": 291.02,
+    "CONFIDENCE": "nominal",
+    "SATELLITE": "GOES-19",
+    "DETECTION_CONFIDENCE_PCT": 48.0
+   }
+  }
+ ],
+ "metadata": {
+  "fetched_at": "2026-10-10T03:01:16Z",
+  "source": "fire_events store"
+ }
+}

@@ -146,6 +146,7 @@ impl MapPanel {
     pub(crate) fn set_work_offline(&mut self, offline: bool) {
         self.work_offline = offline;
         self.tiles.set_offline(offline);
+        self.smf.set_offline(offline);
     }
 
     fn notify(&mut self, msg: impl Into<String>) {
@@ -335,6 +336,7 @@ impl MapPanel {
         {
             self.work_offline = offline;
             self.tiles.set_offline(offline);
+            self.smf.set_offline(offline);
         }
         if ui.button("Download area…").clicked() {
             self.dl.open = true;

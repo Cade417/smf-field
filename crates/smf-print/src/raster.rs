@@ -544,6 +544,7 @@ mod tests {
             max_zoom: tz,
             attribution: String::new(),
             offline_allowed: false,
+            max_age_secs: None,
         });
         let mut r = MapRenderer::new(&device, &queue);
         let svc = TileService::new(dir.join("cache"), || {});
@@ -666,6 +667,7 @@ mod tests {
             max_zoom: z,
             attribution: String::new(),
             offline_allowed: false,
+            max_age_secs: None,
         });
         let mut r = MapRenderer::new(&device, &queue);
         let svc = TileService::new(dir.join("cache"), || {});

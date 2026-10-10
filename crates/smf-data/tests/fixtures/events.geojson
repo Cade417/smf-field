@@ -1,0 +1,112 @@
+{
+ "type": "FeatureCollection",
+ "features": [
+  {
+   "type": "Feature",
+   "geometry": {
+    "type": "Point",
+    "coordinates": [
+     -93.88322,
+     36.93272
+    ]
+   },
+   "properties": {
+    "SOURCE": "SHOWMEFIRE_STORE",
+    "TYPENAME": "viirs",
+    "SOURCE_ID": "VIIRS_NOAA20_NRT:N20:2026-10-09T08:35:00Z:36.933:-93.883",
+    "EVENT_ID": 1036289,
+    "LATITUDE": 36.93272,
+    "LONGITUDE": -93.88322,
+    "COUNTY": "Lawrence",
+    "STATE": "Missouri",
+    "COUNTRY": "United States",
+    "ACQ_DATE_TIME": "2026-10-09T08:35:00Z",
+    "FRP": 2.67,
+    "BRIGHT_T7": null,
+    "CONFIDENCE": "nominal",
+    "SATELLITE": "N20",
+    "TYPE_DESCRIPTION": "Fire detection",
+    "FUEL": "",
+    "LAND_COVER": "Unknown",
+    "DETECTION_CONFIDENCE_PCT": 45.0,
+    "VERIFICATION_TIER": "admin_reviewed",
+    "ACRES": null,
+    "DESCRIPTION": "",
+    "OUT_OF_ORDINARY": ""
+   }
+  },
+  {
+   "type": "Feature",
+   "geometry": {
+    "type": "Point",
+    "coordinates": [
+     -93.88181,
+     36.93068
+    ]
+   },
+   "properties": {
+    "SOURCE": "SHOWMEFIRE_STORE",
+    "TYPENAME": "viirs",
+    "SOURCE_ID": "VIIRS_SNPP_NRT:N:2026-10-09T08:13:00Z:36.931:-93.882",
+    "EVENT_ID": 1036256,
+    "LATITUDE": 36.93068,
+    "LONGITUDE": -93.88181,
+    "COUNTY": "Lawrence",
+    "STATE": "Missouri",
+    "COUNTRY": "United States",
+    "ACQ_DATE_TIME": "2026-10-09T08:13:00Z",
+    "FRP": 1.56,
+    "BRIGHT_T7": null,
+    "CONFIDENCE": "nominal",
+    "SATELLITE": "N",
+    "TYPE_DESCRIPTION": "Fire detection",
+    "FUEL": "",
+    "LAND_COVER": "Unknown",
+    "DETECTION_CONFIDENCE_PCT": 44.0,
+    "VERIFICATION_TIER": "admin_reviewed",
+    "ACRES": null,
+    "DESCRIPTION": "",
+    "OUT_OF_ORDINARY": ""
+   }
+  },
+  {
+   "type": "Feature",
+   "geometry": {
+    "type": "Point",
+    "coordinates": [
+     -93.88103,
+     36.93401
+    ]
+   },
+   "properties": {
+    "SOURCE": "SHOWMEFIRE_STORE",
+    "TYPENAME": "viirs",
+    "SOURCE_ID": "VIIRS_SNPP_NRT:N:2026-10-09T08:13:00Z:36.934:-93.881",
+    "EVENT_ID": 1036257,
+    "LATITUDE": 36.93401,
+    "LONGITUDE": -93.88103,
+    "COUNTY": "Lawrence",
+    "STATE": "Missouri",
+    "COUNTRY": "United States",
+    "ACQ_DATE_TIME": "2026-10-09T08:13:00Z",
+    "FRP": 0.7,
+    "BRIGHT_T7": null,
+    "CONFIDENCE": "nominal",
+    "SATELLITE": "N",
+    "TYPE_DESCRIPTION": "Fire detection",
+    "FUEL": "",
+    "LAND_COVER": "Unknown",
+    "DETECTION_CONFIDENCE_PCT": 43.0,
+    "VERIFICATION_TIER": "admin_reviewed",
+    "ACRES": null,
+    "DESCRIPTION": "",
+    "OUT_OF_ORDINARY": ""
+   }
+  }
+ ],
+ "metadata": {
+  "fetched_at": "2026-10-10T03:01:17Z",
+  "feature_count": 200,
+  "source": "fire_events store"
+ }
+}

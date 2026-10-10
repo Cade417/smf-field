@@ -73,6 +73,8 @@ pub fn print_to_pdf(
     spec: &PrintSpec,
     layers: &RenderLayers,
     project: &Project,
+    // Drawn on the map (beneath the project's markup) but not listed individually in the legend.
+    extra_features: &[smf_features::Feature],
     legend_overlays: &[LegendOverlay],
     progress: &mut dyn FnMut(f32),
     cancel: &AtomicBool,
@@ -100,6 +102,7 @@ pub fn print_to_pdf(
         jpeg,
         [rendered.width, rendered.height],
         project,
+        extra_features,
         legend_overlays,
         &utc_date(),
     )

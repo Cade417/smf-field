@@ -1,0 +1,52 @@
+{
+ "schemaVersion": 1,
+ "runId": "20261010T0600Z-v1",
+ "cycleTime": "2026-10-10T06:00:00Z",
+ "issuedAt": "2026-10-10T09:12:44Z",
+ "horizonHours": 72,
+ "timeCount": 73,
+ "layers": [
+  {
+   "variable": "fire_danger",
+   "aggregation": "hourly",
+   "unit": "category",
+   "dataType": "uint8",
+   "style": {
+    "colormap": "fire_danger",
+    "rescale": [
+     0.0,
+     4.0
+    ]
+   },
+   "tileUrl": "/tiles/forecast/20261010T0600Z-v1/fire_danger/{lead_hour}/{z}/{x}/{y}.png"
+  },
+  {
+   "variable": "temperature_2m",
+   "aggregation": "hourly",
+   "unit": "degC",
+   "dataType": "float32",
+   "style": {
+    "colormap": "turbo",
+    "rescale": [
+     -20.0,
+     45.0
+    ]
+   },
+   "tileUrl": "/tiles/forecast/20261010T0600Z-v1/temperature_2m/{lead_hour}/{z}/{x}/{y}.png"
+  },
+  {
+   "variable": "precipitation_accumulated",
+   "aggregation": "total",
+   "unit": "mm",
+   "dataType": "float32",
+   "style": {
+    "colormap": "blues",
+    "rescale": [
+     0.0,
+     50.0
+    ]
+   },
+   "tileUrl": null
+  }
+ ]
+}

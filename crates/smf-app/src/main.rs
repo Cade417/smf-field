@@ -6,6 +6,8 @@ mod map_panel;
 mod overlay;
 mod panels;
 mod print_ui;
+mod smf_ui;
+mod update;
 
 use eframe::egui;
 use smf_features::{Editor, Geometry, Project, SavedView, Tool};
@@ -45,8 +47,12 @@ struct FieldApp {
     shot: Option<ScreenshotHook>,
     /// SMF_PRINT / SMF_GEOTIFF: close the app when the print job ends.
     exit_on_print: bool,
+    /// Deferred SMF_PRINT request: (path, scale, dpi, when).
+    pending_print: Option<(PathBuf, f64, u32, std::time::Instant)>,
     /// Automated run: never open modal dialogs.
     quiet: bool,
+    about_open: bool,
+    update: std::sync::Arc<std::sync::Mutex<update::UpdateState>>,
 }
 
 /// Dev/verification hook: with SMF_SCREENSHOT=<file.png> the app lets tiles load,
@@ -79,6 +85,7 @@ impl FieldApp {
             saved_revision: 0,
             status: None,
             title: String::new(),
+            pending_print: None,
             exit_on_print: std::env::var_os("SMF_PRINT").is_some()
                 || std::env::var_os("SMF_GEOTIFF").is_some(),
             quiet: shot.is_some()
@@ -86,6 +93,8 @@ impl FieldApp {
                 || std::env::var_os("SMF_PRINT").is_some()
                 || std::env::var_os("SMF_GEOTIFF").is_some(),
             shot,
+            about_open: std::env::var_os("SMF_ABOUT").is_some(),
+            update: std::sync::Arc::new(std::sync::Mutex::new(update::UpdateState::Idle)),
         };
         if let Some(p) = std::env::var_os("SMF_OPEN") {
             app.open_path(p.into());
@@ -97,7 +106,7 @@ impl FieldApp {
     }
 
     /// Verification hooks. SMF_CAM="lng,lat,distance_m,pitch_deg,heading_deg" starts in 3D at that
-    /// camera; SMF_SLOPE=deg|fire turns on slope shading; SMF_SELECT=<feature name> selects it; SMF_IMPORT=a;b imports files at startup; SMF_VIEW=lng,lat,zoom; SMF_DOWNLOAD=lng,lat,span,zmin,zmax,name; SMF_OFFLINE=1; SMF_BASEMAP=id; SMF_LAYER=file[@opacity]; SMF_PRINT=out.pdf[,scale,dpi]; SMF_GEOTIFF=out.tif[,zoom,half_span_deg].
+    /// camera; SMF_SLOPE=deg|fire turns on slope shading; SMF_SELECT=<feature name> selects it; SMF_IMPORT=a;b imports files at startup; SMF_VIEW=lng,lat,zoom; SMF_DOWNLOAD=lng,lat,span,zmin,zmax,name; SMF_OFFLINE=1; SMF_BASEMAP=id; SMF_INFO=<layer id>; SMF_COND=lng,lat; SMF_FORECAST=<lead hours>; SMF_API_BASE=<url>; SMF_LAYER=file[@opacity]; SMF_PRINT=out.pdf[,scale,dpi] (+SMF_PRINT_DELAY secs); SMF_GEOTIFF=out.tif[,zoom,half_span_deg].
     fn apply_dev_env(&mut self) {
         if let Ok(v) = std::env::var("SMF_CAM") {
             let n: Vec<f64> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
@@ -153,19 +162,21 @@ impl FieldApp {
             self.map.dev_add_layer(&path, opacity);
         }
         if let Ok(v) = std::env::var("SMF_PRINT") {
-            // path[,scale_denominator,dpi]
+            // path[,scale_denominator,dpi]; starts after SMF_PRINT_DELAY seconds (default 0) so background
+            // data (catalog, incidents) has loaded, as it would for a person using the dialog.
             let p: Vec<&str> = v.split(',').map(str::trim).collect();
             let scale = p.get(1).and_then(|x| x.parse().ok()).unwrap_or(24_000.0);
             let dpi = p.get(2).and_then(|x| x.parse().ok()).unwrap_or(150);
-            self.map.dev_print(
-                &self.editor,
+            let delay = std::env::var("SMF_PRINT_DELAY")
+                .ok()
+                .and_then(|d| d.parse().ok())
+                .unwrap_or(0.0);
+            self.pending_print = Some((
                 PathBuf::from(p[0]),
-                print_ui::PrintKind::Pdf,
                 scale,
                 dpi,
-                0,
-                None,
-            );
+                std::time::Instant::now() + std::time::Duration::from_secs_f64(delay),
+            ));
         }
         if let Ok(v) = std::env::var("SMF_GEOTIFF") {
             // path,zoom,half_span_degrees  (centered on SMF_VIEW)
@@ -183,6 +194,21 @@ impl FieldApp {
                 zoom,
                 Some(b),
             );
+        }
+        if let Ok(k) = std::env::var("SMF_INFO") {
+            self.map.smf.dev_info = smf_data::DataLayerKind::ALL
+                .into_iter()
+                .find(|d| d.id() == k);
+        }
+        if let Ok(v) = std::env::var("SMF_FORECAST") {
+            self.map.smf.dev_forecast = v.trim().parse().ok();
+        }
+        if let Ok(v) = std::env::var("SMF_COND") {
+            // lng,lat: query point conditions now (the same call a resting pointer makes)
+            let n: Vec<f64> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+            if let [lng, lat] = n[..] {
+                self.map.dev_conditions = Some(LngLat::new(lng, lat));
+            }
         }
         if std::env::var_os("SMF_OFFLINE").is_some() {
             self.map.set_work_offline(true);
@@ -442,6 +468,12 @@ impl FieldApp {
                         ui.close();
                     }
                 });
+                ui.menu_button("Help", |ui| {
+                    if ui.button("Shortcuts and credits").clicked() {
+                        self.about_open = true;
+                        ui.close();
+                    }
+                });
                 ui.separator();
                 for (tool, label, tip) in [
                     (Tool::Select, "Select", "V"),
@@ -584,6 +616,82 @@ impl FieldApp {
         }
     }
 
+    fn about_window(&mut self, ctx: &egui::Context) {
+        if !self.about_open {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("ShowMeFire Field").open(&mut open).collapsible(false).resizable(false).show(ctx, |ui| {
+            ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
+            ui.separator();
+            ui.label(egui::RichText::new("Shortcuts").strong());
+            egui::Grid::new("shortcuts").num_columns(2).spacing([16.0, 2.0]).show(ui, |ui| {
+                for (k, v) in [
+                    ("V / M / L / P / R / T / D / F", "Select, marker, line, polygon, range rings, label, measure, freehand"),
+                    ("Enter / double-click", "Finish a line or polygon"),
+                    ("Esc / Backspace", "Cancel / remove the last point"),
+                    ("Delete", "Delete the selection"),
+                    ("Ctrl+Z / Ctrl+Y", "Undo / redo"),
+                    ("Ctrl+N / O / S", "New / open / save"),
+                    ("Scroll / drag", "Zoom / pan (3D: dolly / pan on the ground)"),
+                    ("Right-drag", "Rotate (3D: orbit and tilt)"),
+                    ("Shift while drawing", "Don't snap to existing points"),
+                    ("Hover or click the map", "Conditions at the pointer; click a fire feature for details"),
+                ] {
+                    ui.label(egui::RichText::new(k).monospace());
+                    ui.label(v);
+                    ui.end_row();
+                }
+            });
+            ui.separator();
+            ui.label(egui::RichText::new("Credits").strong());
+            ui.label("Fire data, conditions and forecast: Show Me Fire (showmefire.org).");
+            ui.label("Basemaps: USGS The National Map, Esri, OpenStreetMap contributors, OpenTopoMap.");
+            ui.label("Terrain: Mapzen, USGS 3DEP, SRTM and other open elevation sources.");
+            ui.label("Built with Rust, wgpu and egui.");
+            ui.separator();
+            let url = std::env::var("SMF_UPDATE_URL").ok().filter(|u| !u.trim().is_empty());
+            let state = self.update.lock().unwrap().clone();
+            match (&url, &state) {
+                (None, _) => {
+                    ui.weak("Update checks are off (set SMF_UPDATE_URL to a release manifest to enable).");
+                }
+                (Some(_), update::UpdateState::Checking) => {
+                    ui.label("Checking for updates...");
+                }
+                (Some(u), _) => {
+                    if ui.button("Check for updates").clicked() {
+                        *self.update.lock().unwrap() = update::UpdateState::Checking;
+                        let (u, st, c) = (u.clone(), self.update.clone(), ctx.clone());
+                        std::thread::spawn(move || {
+                            *st.lock().unwrap() = update::check(&u);
+                            c.request_repaint();
+                        });
+                    }
+                }
+            }
+            match state {
+                update::UpdateState::UpToDate => {
+                    ui.label("You are up to date.");
+                }
+                update::UpdateState::Available(r) => {
+                    ui.colored_label(egui::Color32::from_rgb(80, 200, 120), format!("Version {} is available.", r.version));
+                    if !r.notes.is_empty() {
+                        ui.label(&r.notes);
+                    }
+                    if ui.link("Open download page").clicked() {
+                        let _ = open::that(&r.url);
+                    }
+                }
+                update::UpdateState::Failed(e) => {
+                    ui.colored_label(egui::Color32::from_rgb(230, 130, 90), e);
+                }
+                _ => {}
+            }
+        });
+        self.about_open = open;
+    }
+
     fn update_title(&mut self, ctx: &egui::Context) {
         let name = self.path.as_ref().and_then(|p| p.file_name()).map_or_else(
             || self.editor.project.name.clone(),
@@ -608,6 +716,7 @@ impl eframe::App for FieldApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
         self.update_title(&ctx);
+        self.about_window(&ctx);
         let dropped: Vec<PathBuf> = ctx.input(|i| {
             i.raw
                 .dropped_files
@@ -621,6 +730,22 @@ impl eframe::App for FieldApp {
         self.menu(ui);
         self.map.show(ui, &mut self.editor);
         self.screenshot_hook(&ctx);
+        if let Some((path, scale, dpi, when)) = self.pending_print.clone() {
+            if std::time::Instant::now() >= when {
+                self.pending_print = None;
+                self.map.dev_print(
+                    &self.editor,
+                    path,
+                    print_ui::PrintKind::Pdf,
+                    scale,
+                    dpi,
+                    0,
+                    None,
+                );
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_millis(250));
+            }
+        }
         if self.exit_on_print {
             match self.map.print_outcome() {
                 Some(Ok(msg)) => {

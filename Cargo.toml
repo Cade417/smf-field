@@ -33,3 +33,10 @@ proptest = "1"
 
 [workspace.lints.clippy]
 all = "warn"
+
+# Smaller, faster release binaries: thin LTO and one codegen unit cost build time but shrink and speed up the app.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+opt-level = 3

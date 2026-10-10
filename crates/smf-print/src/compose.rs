@@ -11,7 +11,12 @@ use smf_geo::{LngLat, destination, format_distance, geodesic_circle};
 pub struct LegendOverlay {
     pub name: String,
     pub opacity: f32,
+    /// Swatch colour (live-data layers); None draws a neutral grey.
+    pub color: Option<[u8; 3]>,
 }
+
+/// (label, the feature it stands for if any, swatch colour for data layers)
+type LegendEntry<'a> = (String, Option<&'a Feature>, Option<[u8; 3]>);
 
 pub struct Composed {
     pub bytes: Vec<u8>,
@@ -537,19 +542,27 @@ fn draw_north_arrow(page: &mut Page, spec: &PrintSpec, layout: &Layout) {
 }
 
 fn draw_legend(page: &mut Page, layout: &Layout, project: &Project, overlays: &[LegendOverlay]) {
-    let mut entries: Vec<(String, Option<&Feature>)> = vec![];
+    let mut entries: Vec<LegendEntry> = vec![];
     for f in project
         .features
         .iter()
         .filter(|f| project.is_visible(f) && !f.name.is_empty())
     {
-        if !matches!(f.geometry, Geometry::Label(_)) && !entries.iter().any(|(n, _)| *n == f.name) {
-            entries.push((f.name.clone(), Some(f)));
+        if !matches!(f.geometry, Geometry::Label(_))
+            && !entries.iter().any(|(n, _, _)| *n == f.name)
+        {
+            entries.push((f.name.clone(), Some(f), None));
         }
     }
     entries.truncate(14);
     for o in overlays {
-        entries.push((format!("{} ({:.0}%)", o.name, o.opacity * 100.0), None));
+        // Opacity >= 1 means "not a blended layer" (live data counts etc.): no percentage.
+        let label = if o.opacity < 0.995 {
+            format!("{} ({:.0}%)", o.name, o.opacity * 100.0)
+        } else {
+            o.name.clone()
+        };
+        entries.push((label, None, o.color));
     }
     if entries.is_empty() {
         return;
@@ -558,7 +571,7 @@ fn draw_legend(page: &mut Page, layout: &Layout, project: &Project, overlays: &[
     let row = 4.4;
     let w = entries
         .iter()
-        .map(|(n, _)| text_width_mm(n, 6.5, Font::Regular))
+        .map(|(n, _, _)| text_width_mm(n, 6.5, Font::Regular))
         .fold(0.0, f64::max)
         .max(text_width_mm("Legend", 7.5, Font::Bold))
         + 14.0;
@@ -572,7 +585,7 @@ fn draw_legend(page: &mut Page, layout: &Layout, project: &Project, overlays: &[
     page.restore();
     page.fill_color(Rgb::BLACK);
     page.text(x + 2.0, y + 4.5, 7.5, Font::Bold, Align::Left, "Legend");
-    for (i, (name, feat)) in entries.iter().enumerate() {
+    for (i, (name, feat, swatch)) in entries.iter().enumerate() {
         let ry = y + 7.0 + i as f64 * row;
         page.save();
         match feat.map(|f| (&f.geometry, Rgb::from_u8(f.style.color))) {
@@ -594,7 +607,7 @@ fn draw_legend(page: &mut Page, layout: &Layout, project: &Project, overlays: &[
                 page.fill();
             }
             None => {
-                page.fill_color(Rgb(0.7, 0.7, 0.7));
+                page.fill_color(swatch.map_or(Rgb(0.7, 0.7, 0.7), Rgb::from_u8));
                 page.rect(x + 2.0, ry + 0.4, 7.0, 2.6);
                 page.fill();
             }
@@ -611,6 +624,7 @@ pub fn compose_pdf(
     map_jpeg: Vec<u8>,
     map_px: [u32; 2],
     project: &Project,
+    extra: &[Feature],
     overlays: &[LegendOverlay],
     date: &str,
 ) -> Result<Composed, LayoutError> {
@@ -649,6 +663,10 @@ pub fn compose_pdf(
     page.save();
     page.rect(f.x, f.y, f.w, f.h);
     page.clip();
+    // Live data first (beneath), then the user's own markup; only the latter is listed in the legend.
+    for f in extra {
+        draw_feature(&mut page, &pj, f);
+    }
     draw_features(&mut page, &pj, project);
     page.restore();
 
@@ -741,7 +759,7 @@ mod tests {
         let jpg = tiny_jpeg(px[0], px[1]);
         (
             jpg.clone(),
-            compose_pdf(spec, jpg, px, project, ov, "2026-10-09").unwrap(),
+            compose_pdf(spec, jpg, px, project, &[], ov, "2026-10-09").unwrap(),
         )
     }
 
@@ -786,6 +804,7 @@ mod tests {
             &[LegendOverlay {
                 name: "Fire danger".into(),
                 opacity: 0.6,
+                color: None,
             }],
         );
         let doc = Document::load_mem(&c.bytes).unwrap();
@@ -957,6 +976,7 @@ mod tests {
             &[LegendOverlay {
                 name: "Overlay".into(),
                 opacity: 0.5,
+                color: None,
             }],
         );
         let doc = Document::load_mem(&c.bytes).unwrap();

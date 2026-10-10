@@ -1,0 +1,10 @@
+{
+ "type": "FeatureCollection",
+ "metadata": {
+  "generated_at": "2026-10-10T03:01:17Z",
+  "feature_count": 0,
+  "join_key": "zone_code",
+  "crs": "EPSG:4326"
+ },
+ "features": []
+}

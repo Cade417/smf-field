@@ -122,6 +122,42 @@ pub fn pick(
     interior
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GeoHit {
+    /// On a marker, a line, or a polygon outline.
+    Edge,
+    /// Inside a polygon but not near its outline.
+    Interior,
+}
+
+/// How the pointer relates to a single geometry (used to pick live data layers, which are not project features).
+pub fn geometry_hit(
+    g: &Geometry,
+    proj: &dyn Fn(LngLat) -> [f64; 2],
+    pt: [f64; 2],
+    tol: f64,
+) -> Option<GeoHit> {
+    let paths = screen_paths(g, proj);
+    match g {
+        Geometry::Marker(_) | Geometry::Label(_) => {
+            let s = paths[0][0];
+            ((s[0] - pt[0]).hypot(s[1] - pt[1]) <= tol * 1.5).then_some(GeoHit::Edge)
+        }
+        _ => {
+            if paths.iter().any(|path| {
+                path.windows(2)
+                    .any(|w| dist_to_segment(pt, w[0], w[1]) <= tol)
+            }) {
+                Some(GeoHit::Edge)
+            } else if matches!(g, Geometry::Polygon(_)) && point_in_polygon(pt, &paths[0]) {
+                Some(GeoHit::Interior)
+            } else {
+                None
+            }
+        }
+    }
+}
+
 /// Nearest existing vertex within `tol` px, for snapping new points to old ones.
 pub fn snap(
     project: &Project,
@@ -218,6 +254,33 @@ mod tests {
         let s = snap(&e.project, &proj, [203.0, 2.0], 8.0).unwrap();
         assert_eq!(s, LngLat::new(2.0, 0.0));
         assert!(snap(&e.project, &proj, [350.0, 200.0], 8.0).is_none());
+    }
+
+    #[test]
+    fn geometry_hit_distinguishes_edge_interior_and_miss() {
+        let poly = Geometry::Polygon(vec![
+            LngLat::new(0.0, 0.0),
+            LngLat::new(4.0, 0.0),
+            LngLat::new(4.0, 4.0),
+            LngLat::new(0.0, 4.0),
+        ]);
+        let pr = &proj;
+        assert_eq!(
+            geometry_hit(&poly, pr, [200.0, 0.0], 5.0),
+            Some(GeoHit::Edge),
+            "on the outline"
+        );
+        assert_eq!(
+            geometry_hit(&poly, pr, [200.0, -200.0], 5.0),
+            Some(GeoHit::Interior)
+        );
+        assert_eq!(geometry_hit(&poly, pr, [900.0, -200.0], 5.0), None);
+        let m = Geometry::Marker(LngLat::new(1.0, 1.0));
+        assert_eq!(
+            geometry_hit(&m, pr, [104.0, -98.0], 5.0),
+            Some(GeoHit::Edge)
+        );
+        assert_eq!(geometry_hit(&m, pr, [150.0, -100.0], 5.0), None);
     }
 
     #[test]

@@ -258,6 +258,63 @@ fn draw_feature(painter: &Painter, pj: &Projector, f: &Feature, selected: bool) 
     }
 }
 
+/// A live Show Me Fire feature (incident, footprint, burn ban...). `visible` is the on-screen area
+/// plus a margin; anything entirely outside it is skipped.
+pub fn draw_data_feature(
+    painter: &Painter,
+    pj: &Projector,
+    f: &smf_data::DataFeature,
+    visible: egui::Rect,
+) {
+    let col = color(f.style.color);
+    match &f.geometry {
+        Geometry::Marker(p) => {
+            let Some(c) = pj.pos(*p).filter(|c| visible.contains(*c)) else {
+                return;
+            };
+            let r = f.style.radius.max(2.5);
+            painter.circle_filled(c, r + 1.6, Color32::WHITE);
+            painter.circle_filled(c, r, col);
+            if r >= 6.0 {
+                // Incident markers get a centre dot so they read differently from raw detections.
+                painter.circle_filled(c, 2.4, Color32::WHITE);
+            }
+        }
+        Geometry::Polygon(v) => {
+            let mut ring = v.clone();
+            ring.push(v[0]);
+            let segs = pj.polyline(&ring);
+            let Some(first) = segs.first() else { return };
+            let (mut min, mut max) = (first[0], first[0]);
+            for p in segs.iter().flatten() {
+                min = Pos2::new(min.x.min(p.x), min.y.min(p.y));
+                max = Pos2::new(max.x.max(p.x), max.y.max(p.y));
+            }
+            if !visible.intersects(egui::Rect::from_min_max(min, max)) {
+                return;
+            }
+            if let [one] = &segs[..] {
+                let mut pts = one.clone();
+                pts.pop();
+                fill_polygon(
+                    painter,
+                    &pts,
+                    Color32::from_rgba_unmultiplied(
+                        f.style.color[0],
+                        f.style.color[1],
+                        f.style.color[2],
+                        f.style.fill_alpha,
+                    ),
+                );
+            }
+            for seg in segs {
+                painter.add(Shape::line(seg, Stroke::new(f.style.width, col)));
+            }
+        }
+        _ => {}
+    }
+}
+
 pub fn draw_project(painter: &Painter, pj: &Projector, editor: &Editor) {
     for f in editor
         .project

@@ -51,6 +51,9 @@ pub struct TileSource {
     pub attribution: String,
     /// Gate for the offline downloader; restricted providers forbid bulk download.
     pub offline_allowed: bool,
+    /// Cached tiles older than this are re-fetched (live data layers). None = cached tiles never expire.
+    #[serde(default)]
+    pub max_age_secs: Option<u64>,
 }
 
 impl TileSource {

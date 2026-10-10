@@ -9,4 +9,4 @@ pub use editor::{Command, Editor, Tool, simplify};
 pub use model::{
     FORMAT_VERSION, Feature, Folder, Geometry, Id, Project, SavedView, Style, default_radii,
 };
-pub use pick::{Hit, pick, screen_paths, snap};
+pub use pick::{GeoHit, Hit, geometry_hit, pick, screen_paths, snap};

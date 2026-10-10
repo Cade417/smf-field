@@ -1,0 +1,470 @@
+{
+ "success": true,
+ "layers": [
+  {
+   "id": "fire_danger",
+   "label": "Fire danger",
+   "units": "category",
+   "filename": "latest/realtime_fire_danger.tif",
+   "colormap": "fire_danger",
+   "rescale": [
+    0,
+    4
+   ],
+   "group": "rtma",
+   "available": true,
+   "observed_at": "2026-10-10T01:00:00Z",
+   "categories": [
+    "Low",
+    "Moderate",
+    "Elevated",
+    "Critical",
+    "Extreme"
+   ],
+   "legend": [
+    {
+     "value": 0,
+     "color": "#90ee90",
+     "label": "Low"
+    },
+    {
+     "value": 1,
+     "color": "#ffed4e",
+     "label": "Moderate"
+    },
+    {
+     "value": 2,
+     "color": "#ffa500",
+     "label": "Elevated"
+    },
+    {
+     "value": 3,
+     "color": "#ff0000",
+     "label": "Critical"
+    },
+    {
+     "value": 4,
+     "color": "#8b0000",
+     "label": "Extreme"
+    }
+   ]
+  },
+  {
+   "id": "temperature",
+   "label": "Temperature",
+   "units": "°F",
+   "filename": "latest/realtime_temperature.tif",
+   "colormap": "turbo",
+   "rescale": [
+    10,
+    105
+   ],
+   "group": "rtma",
+   "available": true,
+   "observed_at": "2026-10-10T01:00:00Z",
+   "categories": null,
+   "legend": [
+    {
+     "value": 10.0,
+     "color": "#30123b"
+    },
+    {
+     "value": 29.0,
+     "color": "#3e9bfe"
+    },
+    {
+     "value": 48.0,
+     "color": "#46f783"
+    },
+    {
+     "value": 67.0,
+     "color": "#e1dc37"
+    },
+    {
+     "value": 86.0,
+     "color": "#ef5a11"
+    },
+    {
+     "value": 105.0,
+     "color": "#7a0402"
+    }
+   ]
+  },
+  {
+   "id": "rh",
+   "label": "Relative humidity",
+   "units": "%",
+   "filename": "latest/realtime_rh.tif",
+   "colormap": "rdylbu",
+   "rescale": [
+    0,
+    100
+   ],
+   "group": "rtma",
+   "available": true,
+   "observed_at": "2026-10-10T01:00:00Z",
+   "categories": null,
+   "legend": [
+    {
+     "value": 0.0,
+     "color": "#a50026"
+    },
+    {
+     "value": 20.0,
+     "color": "#f46d43"
+    },
+    {
+     "value": 40.0,
+     "color": "#fee090"
+    },
+    {
+     "value": 60.0,
+     "color": "#e0f3f7"
+    },
+    {
+     "value": 80.0,
+     "color": "#74add1"
+    },
+    {
+     "value": 100.0,
+     "color": "#313695"
+    }
+   ]
+  },
+  {
+   "id": "wind",
+   "label": "Wind speed",
+   "units": "kt",
+   "filename": "latest/realtime_wind.tif",
+   "colormap": "viridis",
+   "rescale": [
+    0,
+    30
+   ],
+   "group": "rtma",
+   "available": true,
+   "observed_at": "2026-10-10T01:00:00Z",
+   "categories": null,
+   "legend": [
+    {
+     "value": 0.0,
+     "color": "#440154"
+    },
+    {
+     "value": 6.0,
+     "color": "#404387"
+    },
+    {
+     "value": 12.0,
+     "color": "#29788e"
+    },
+    {
+     "value": 18.0,
+     "color": "#22a784"
+    },
+    {
+     "value": 24.0,
+     "color": "#79d151"
+    },
+    {
+     "value": 30.0,
+     "color": "#fde724"
+    }
+   ]
+  },
+  {
+   "id": "fuel_moisture",
+   "label": "Fuel moisture",
+   "units": "%",
+   "filename": "latest/realtime_fuel_moisture.tif",
+   "colormap": "rdylgn",
+   "rescale": [
+    2,
+    30
+   ],
+   "group": "rtma",
+   "available": true,
+   "observed_at": "2026-10-10T01:00:00Z",
+   "categories": null,
+   "legend": [
+    {
+     "value": 2.0,
+     "color": "#a50026"
+    },
+    {
+     "value": 7.6,
+     "color": "#f46d43"
+    },
+    {
+     "value": 13.2,
+     "color": "#fee08b"
+    },
+    {
+     "value": 18.8,
+     "color": "#d9ef8b"
+    },
+    {
+     "value": 24.4,
+     "color": "#66bd63"
+    },
+    {
+     "value": 30.0,
+     "color": "#006837"
+    }
+   ]
+  },
+  {
+   "id": "precipitation",
+   "label": "Precipitation",
+   "units": "mm",
+   "filename": "latest/realtime_precipitation.tif",
+   "colormap": "blues",
+   "rescale": [
+    0,
+    25
+   ],
+   "group": "rtma",
+   "available": true,
+   "observed_at": "2026-10-10T01:00:00Z",
+   "categories": null,
+   "legend": [
+    {
+     "value": 0.0,
+     "color": "#f7fbff"
+    },
+    {
+     "value": 5.0,
+     "color": "#cfe1f2"
+    },
+    {
+     "value": 10.0,
+     "color": "#93c4de"
+    },
+    {
+     "value": 15.0,
+     "color": "#4a97c9"
+    },
+    {
+     "value": 20.0,
+     "color": "#1764ab"
+    },
+    {
+     "value": 25.0,
+     "color": "#08306b"
+    }
+   ]
+  },
+  {
+   "id": "spread_rate",
+   "label": "Spread rate",
+   "units": "ch/hr",
+   "filename": "latest/realtime_spread_rate.tif",
+   "colormap": "magma",
+   "rescale": [
+    0,
+    60
+   ],
+   "group": "rtma",
+   "available": true,
+   "observed_at": "2026-10-10T01:00:00Z",
+   "categories": null,
+   "legend": [
+    {
+     "value": 0.0,
+     "color": "#000003"
+    },
+    {
+     "value": 12.0,
+     "color": "#3b0f6f"
+    },
+    {
+     "value": 24.0,
+     "color": "#8c2980"
+    },
+    {
+     "value": 36.0,
+     "color": "#dd4968"
+    },
+    {
+     "value": 48.0,
+     "color": "#fd9f6c"
+    },
+    {
+     "value": 60.0,
+     "color": "#fbfcbf"
+    }
+   ]
+  },
+  {
+   "id": "station_fire_danger",
+   "label": "Fire danger (station analysis)",
+   "units": "category",
+   "filename": "realtime/realtime_fire_danger.tif",
+   "colormap": "rgba",
+   "rescale": [
+    0,
+    4
+   ],
+   "group": "station_fill",
+   "available": true,
+   "observed_at": "2026-10-10T03:01:07.985255+00:00",
+   "categories": [
+    "Low",
+    "Moderate",
+    "Elevated",
+    "Critical",
+    "Extreme"
+   ],
+   "legend": [
+    {
+     "value": 0,
+     "color": "#90ee90",
+     "label": "Low"
+    },
+    {
+     "value": 1,
+     "color": "#ffed4e",
+     "label": "Moderate"
+    },
+    {
+     "value": 2,
+     "color": "#ffa500",
+     "label": "Elevated"
+    },
+    {
+     "value": 3,
+     "color": "#ff0000",
+     "label": "Critical"
+    },
+    {
+     "value": 4,
+     "color": "#8b0000",
+     "label": "Extreme"
+    }
+   ]
+  },
+  {
+   "id": "station_rh",
+   "label": "Relative humidity",
+   "units": "%",
+   "filename": "realtime/relative_humidity.tif",
+   "colormap": "rgba",
+   "rescale": [
+    0,
+    100
+   ],
+   "group": "station_fill",
+   "available": true,
+   "observed_at": "2026-10-10T02:46:42.135516+00:00",
+   "categories": null,
+   "legend": [
+    {
+     "value": 0.0,
+     "color": "#a50026"
+    },
+    {
+     "value": 20.0,
+     "color": "#f46d43"
+    },
+    {
+     "value": 40.0,
+     "color": "#fee08b"
+    },
+    {
+     "value": 60.0,
+     "color": "#d9ef8b"
+    },
+    {
+     "value": 80.0,
+     "color": "#66bd63"
+    },
+    {
+     "value": 100.0,
+     "color": "#006837"
+    }
+   ]
+  },
+  {
+   "id": "station_fuel_moisture",
+   "label": "Fuel moisture",
+   "units": "%",
+   "filename": "realtime/fuel_moisture.tif",
+   "colormap": "rgba",
+   "rescale": [
+    0,
+    30
+   ],
+   "group": "station_fill",
+   "available": true,
+   "observed_at": "2026-10-10T03:00:21.904599+00:00",
+   "categories": null,
+   "legend": [
+    {
+     "value": 0.0,
+     "color": "#a50026"
+    },
+    {
+     "value": 6.0,
+     "color": "#f46d43"
+    },
+    {
+     "value": 12.0,
+     "color": "#fee08b"
+    },
+    {
+     "value": 18.0,
+     "color": "#d9ef8b"
+    },
+    {
+     "value": 24.0,
+     "color": "#66bd63"
+    },
+    {
+     "value": 30.0,
+     "color": "#006837"
+    }
+   ]
+  },
+  {
+   "id": "station_wind",
+   "label": "Wind speed",
+   "units": "mph",
+   "filename": "realtime/wind_speed.tif",
+   "colormap": "rgba",
+   "rescale": [
+    0,
+    51
+   ],
+   "group": "station_fill",
+   "available": true,
+   "observed_at": "2026-10-10T02:47:33.233479+00:00",
+   "categories": null,
+   "legend": [
+    {
+     "value": 0.0,
+     "color": "#006837"
+    },
+    {
+     "value": 10.2,
+     "color": "#66bd63"
+    },
+    {
+     "value": 20.4,
+     "color": "#d9ef8b"
+    },
+    {
+     "value": 30.6,
+     "color": "#fee08b"
+    },
+    {
+     "value": 40.8,
+     "color": "#f46d43"
+    },
+    {
+     "value": 51.0,
+     "color": "#a50026"
+    }
+   ]
+  }
+ ]
+}

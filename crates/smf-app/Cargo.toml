@@ -31,3 +31,15 @@ rfd = "0.15"
 earcutr = "0.4"
 serde_json.workspace = true
 serde.workspace = true
+crossbeam-channel = "0.5"
+open = "5"
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
+
+# Installer settings for cargo-packager (https://github.com/crabnebula-dev/cargo-packager).
+# Configured but not yet exercised on clean machines; see README "Known limits".
+[package.metadata.packager]
+product-name = "ShowMeFire Field"
+identifier = "org.showmefire.field"
+description = "CalTopo-style mapping with Show Me Fire data"
+authors = ["Central Crossing Fire Protection District"]
+formats = ["nsis", "dmg", "appimage"]

@@ -1,0 +1,195 @@
+{
+ "type": "FeatureCollection",
+ "features": [
+  {
+   "type": "Feature",
+   "geometry": {
+    "type": "Polygon",
+    "coordinates": [
+     [
+      [
+       -93.84992759172104,
+       38.053470147033586
+      ],
+      [
+       -93.82389022270434,
+       38.05249840696112
+      ],
+      [
+       -93.81551972550169,
+       38.02624927301826
+      ],
+      [
+       -93.81578958083641,
+       38.02486436309312
+      ],
+      [
+       -93.81878854215546,
+       38.02351469541525
+      ],
+      [
+       -93.82017819598465,
+       38.02406310415602
+      ],
+      [
+       -93.82202638808882,
+       38.026131339921136
+      ],
+      [
+       -93.84180376968422,
+       38.02687659919011
+      ],
+      [
+       -93.84992759172104,
+       38.053470147033586
+      ]
+     ]
+    ]
+   },
+   "properties": {
+    "SOURCE": "SHOWMEFIRE_INCIDENT",
+    "TYPENAME": "incident",
+    "INCIDENT_ID": 2670,
+    "INCIDENT_SLUG": "IiZmIlcrHGqx",
+    "DETECTION_COUNT": 47,
+    "COUNTY": "St Clair",
+    "FIRST_DETECTED_AT": "2026-10-09T19:55:00Z",
+    "LAST_DETECTED_AT": "2026-10-10T01:41:18.000000Z",
+    "ACQ_DATE_TIME": "2026-10-10T01:41:18.000000Z",
+    "FRP": 0.39,
+    "BRIGHT_T7": 290.85,
+    "CONFIDENCE": "nominal",
+    "SATELLITE": "GOES-19",
+    "TYPE_DESCRIPTION": "Fire detection",
+    "LAND_COVER": "Trees:68,Grass/Herbs:18,Water:8,Developed:3,Cropland:2,Shrubs:1",
+    "DETECTION_CONFIDENCE_PCT": 55.0,
+    "GRAPHIC_URL": "https://api.showmefire.org/images/fire-incidents/IiZmIlcrHGqx.png",
+    "FEEDBACK_URL": "/fires/incident/IiZmIlcrHGqx",
+    "CONFIRMED": false,
+    "FEEDBACK_COUNT": 0,
+    "INCIDENT_CONFIDENCE_PCT": 76,
+    "INCIDENT_CONFIDENCE_LABEL": "high",
+    "INCIDENT_CONFIDENCE_REASONS": [
+     "Seen in 24 satellite scans over 5.8 h",
+     "Moderate heat output (11 MW peak)",
+     "Confirmed by more than one satellite (GOES + polar orbiter)",
+     "Satellite's own confidence flag is high"
+    ],
+    "INCIDENT_CONFIDENCE_FACTORS": [
+     {
+      "label": "Seen in 24 satellite scans over 5.8 h",
+      "effect": "raises",
+      "points": 15
+     },
+     {
+      "label": "Moderate heat output (11 MW peak)",
+      "effect": "raises",
+      "points": 3
+     },
+     {
+      "label": "Confirmed by more than one satellite (GOES + polar orbiter)",
+      "effect": "raises",
+      "points": 10
+     },
+     {
+      "label": "Satellite's own confidence flag is high",
+      "effect": "raises",
+      "points": 5
+     }
+    ]
+   }
+  },
+  {
+   "type": "Feature",
+   "geometry": {
+    "type": "Polygon",
+    "coordinates": [
+     [
+      [
+       -89.89124896088542,
+       36.25110932753444
+      ],
+      [
+       -89.8667385024942,
+       36.25048416811903
+      ],
+      [
+       -89.86097503911458,
+       36.22500167246557
+      ],
+      [
+       -89.8854854975058,
+       36.22562683188097
+      ],
+      [
+       -89.89124896088542,
+       36.25110932753444
+      ]
+     ]
+    ]
+   },
+   "properties": {
+    "SOURCE": "SHOWMEFIRE_INCIDENT",
+    "TYPENAME": "incident",
+    "INCIDENT_ID": 2690,
+    "INCIDENT_SLUG": "8kkvnDLfrZSp",
+    "DETECTION_COUNT": 11,
+    "COUNTY": "Pemiscot",
+    "FIRST_DETECTED_AT": "2026-10-09T22:51:18.000000Z",
+    "LAST_DETECTED_AT": "2026-10-09T23:41:18.000000Z",
+    "ACQ_DATE_TIME": "2026-10-09T23:41:18.000000Z",
+    "FRP": 2.01,
+    "BRIGHT_T7": 291.14,
+    "CONFIDENCE": "nominal",
+    "SATELLITE": "GOES-19",
+    "TYPE_DESCRIPTION": "Fire detection",
+    "LAND_COVER": "Cropland:89,Developed:8,Grass/Herbs:1,Trees:1,Water:1",
+    "DETECTION_CONFIDENCE_PCT": 46.0,
+    "GRAPHIC_URL": "https://api.showmefire.org/images/fire-incidents/8kkvnDLfrZSp.png",
+    "FEEDBACK_URL": "/fires/incident/8kkvnDLfrZSp",
+    "CONFIRMED": false,
+    "FEEDBACK_COUNT": 0,
+    "INCIDENT_CONFIDENCE_PCT": 56,
+    "INCIDENT_CONFIDENCE_LABEL": "moderate",
+    "INCIDENT_CONFIDENCE_REASONS": [
+     "Seen in 6 satellite scans over 0.8 h",
+     "High heat output (36 MW peak)",
+     "Only one satellite source has seen it",
+     "Satellite's own confidence flag is high",
+     "Satellite pixels are 89% cropland - bright bare fields can occasionally cause false detections"
+    ],
+    "INCIDENT_CONFIDENCE_FACTORS": [
+     {
+      "label": "Seen in 6 satellite scans over 0.8 h",
+      "effect": "raises",
+      "points": 3
+     },
+     {
+      "label": "High heat output (36 MW peak)",
+      "effect": "raises",
+      "points": 9
+     },
+     {
+      "label": "Only one satellite source has seen it",
+      "effect": "lowers",
+      "points": -2
+     },
+     {
+      "label": "Satellite's own confidence flag is high",
+      "effect": "raises",
+      "points": 5
+     },
+     {
+      "label": "Satellite pixels are 89% cropland - bright bare fields can occasionally cause false detections",
+      "effect": "lowers",
+      "points": -4
+     }
+    ]
+   }
+  }
+ ],
+ "metadata": {
+  "fetched_at": "2026-10-10T03:01:15Z",
+  "source": "fire_incidents store (ML shape extraction)"
+ }
+}

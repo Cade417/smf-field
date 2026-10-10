@@ -1,0 +1,25 @@
+{
+ "success": true,
+ "lat": 38.58,
+ "lon": -92.17,
+ "observed_at": "2026-10-10T01:00:00Z",
+ "values": {
+  "fire_danger": 0,
+  "temperature": 74,
+  "rh": 59,
+  "wind": 4.0,
+  "fuel_moisture": 10.4,
+  "precipitation": 0.0,
+  "spread_rate": 2.2
+ },
+ "fire_danger_label": "Low",
+ "units": {
+  "fire_danger": "category",
+  "temperature": "°F",
+  "rh": "%",
+  "wind": "kt",
+  "fuel_moisture": "%",
+  "precipitation": "mm",
+  "spread_rate": "ch/hr"
+ }
+}

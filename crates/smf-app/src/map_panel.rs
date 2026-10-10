@@ -5,6 +5,7 @@
 use crate::layers::LayerStore;
 use crate::layers_ui::{ActiveDownload, DownloadUi, OverlayLayer};
 use crate::print_ui::PrintUi;
+use crate::smf_ui::SmfState;
 use crate::{overlay, panels};
 use directories::ProjectDirs;
 use eframe::egui::{self, Align2, Color32, Key, PointerButton, Pos2, Rect, Sense, Stroke, Vec2};
@@ -122,6 +123,9 @@ pub struct MapPanel {
     pub(crate) was_downloading: bool,
     pub(crate) notice: Option<(String, Instant)>,
     pub(crate) print: PrintUi,
+    pub(crate) smf: SmfState,
+    /// SMF_COND verification hook: query conditions here on the first frame.
+    pub dev_conditions: Option<LngLat>,
     pub(crate) cache_dir: std::path::PathBuf,
 }
 
@@ -192,6 +196,8 @@ impl MapPanel {
             was_downloading: false,
             notice: None,
             print: PrintUi::default(),
+            smf: SmfState::new(&cc.egui_ctx),
+            dev_conditions: None,
             cache_dir,
         };
         panel.init_layers();
@@ -258,6 +264,10 @@ impl MapPanel {
 
     pub fn show(&mut self, ui: &mut egui::Ui, editor: &mut Editor) {
         self.poll_downloads();
+        self.poll_smf(ui.ctx());
+        if let Some(ll) = self.dev_conditions.take() {
+            self.query_conditions(ll, ui.ctx());
+        }
         egui::Panel::top("toolbar").show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.label("Basemap");
@@ -275,6 +285,7 @@ impl MapPanel {
                 ui.selectable_value(&mut want, ViewMode::Flat, "2D");
                 ui.selectable_value(&mut want, ViewMode::Terrain, "3D");
                 self.set_mode(want);
+                ui.menu_button("Show Me Fire", |ui| self.smf_menu(ui, editor));
                 ui.menu_button("Layers", |ui| self.layers_menu(ui));
                 ui.menu_button("Offline", |ui| self.offline_menu(ui));
                 ui.menu_button("Shading", |ui| self.shading_menu(ui));
@@ -338,6 +349,14 @@ impl MapPanel {
                             .color(Color32::from_rgb(230, 160, 60)),
                     );
                 }
+                if let Some((msg, _)) = &self.smf.feedback {
+                    ui.separator();
+                    ui.label(msg);
+                }
+                if let Some(c) = &self.smf.conditions {
+                    ui.separator();
+                    ui.add(egui::Label::new(c).truncate());
+                }
                 if let Some((msg, _)) = &self.notice {
                     ui.separator();
                     ui.label(msg);
@@ -361,6 +380,7 @@ impl MapPanel {
         egui::CentralPanel::default().show(ui, |ui| self.map_area(ui, editor));
         self.layer_windows(ui.ctx(), editor);
         self.print_window(ui.ctx(), editor);
+        self.smf_windows(ui.ctx(), editor);
     }
 
     fn shading_menu(&mut self, ui: &mut egui::Ui) {
@@ -451,6 +471,7 @@ impl MapPanel {
                 ppp,
             },
         };
+        self.draw_smf_data(&painter, &pj, rect);
         overlay::draw_project(&painter, &pj, editor);
         let proj = self.proj();
         let cursor_ll = resp
@@ -466,6 +487,8 @@ impl MapPanel {
             self.request_terrain_tile(TileId::from_lnglat(ll, z), -1.0);
         }
         self.draw_chrome(ui, cursor_ll, rect, ppp, &src);
+        self.draw_smf_legends(&painter, rect);
+        self.smf_conditions_tick(resp.hover_pos(), cursor_ll, ui.ctx());
     }
 
     fn proj(&self) -> Proj<'_> {
@@ -830,7 +853,11 @@ impl MapPanel {
             if editor.tool == Tool::Select {
                 match pick(&editor.project, editor.selection, &project, pt, tol) {
                     Some(Hit { id, .. }) => editor.selection = Some(id),
-                    None => editor.selection = None,
+                    None => {
+                        editor.selection = None;
+                        // Nothing of the user's under the pointer: offer live Show Me Fire data instead.
+                        self.smf.info = Self::smf_pick(&self.smf, &project, pt, tol);
+                    }
                 }
             } else if let Some(mut ll) = proj.unproject(pt) {
                 if !shift && let Some(s) = snap(&editor.project, &project, pt, tol) {

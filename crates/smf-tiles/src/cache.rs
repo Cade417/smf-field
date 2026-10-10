@@ -43,6 +43,35 @@ impl DiskCache {
         .flatten()
     }
 
+    /// The tile and how many seconds ago it was fetched.
+    pub fn get_with_age(&self, t: TileId) -> Option<(Vec<u8>, u64)> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let c = self.conn.lock().unwrap();
+        c.query_row(
+            "SELECT tile_data, fetched_at FROM tiles WHERE zoom_level=?1 AND tile_column=?2 AND tile_row=?3",
+            params![t.z, t.x, t.tms_y()],
+            |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Option<i64>>(1)?)),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .map(|(data, at)| (data, (now - at.unwrap_or(0)).max(0) as u64))
+    }
+
+    /// Test helper: pretend every tile was fetched `secs` seconds ago.
+    #[cfg(test)]
+    pub fn backdate_all(&self, secs: i64) {
+        let c = self.conn.lock().unwrap();
+        c.execute(
+            "UPDATE tiles SET fetched_at = fetched_at - ?1",
+            params![secs],
+        )
+        .unwrap();
+    }
+
     pub fn put(&self, t: TileId, data: &[u8]) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
