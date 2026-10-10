@@ -1,0 +1,17 @@
+[package]
+name = "smf-net"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+# One small HTTP layer for every crate: a callback API that works the same natively (a thread
+# per request) and in the browser (the fetch API), so the rest of the code never blocks.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls", "query"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+ehttp = { version = "0.6", default-features = false }

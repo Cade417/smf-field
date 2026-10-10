@@ -13,4 +13,4 @@ smf-geo.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls", "query"] }
+smf-net.workspace = true

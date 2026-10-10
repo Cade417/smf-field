@@ -5,12 +5,10 @@
 
 use crate::map_panel::MapPanel;
 use crate::overlay::{self, Projector};
-use directories::ProjectDirs;
 use eframe::egui::{self, Align2, Color32, Key, Pos2, Rect, Stroke};
 use smf_features::Editor;
 use smf_geo::LngLat;
 use smf_w3w::{Line, Square, W3wClient, W3wError};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
@@ -41,7 +39,6 @@ pub struct W3wState {
     key: String,
     base: String,
     client: Option<Arc<W3wClient>>,
-    path: PathBuf,
     pub dialog: bool,
     key_edit: String,
     pub query: String,
@@ -64,30 +61,26 @@ pub struct W3wState {
 
 impl W3wState {
     pub fn new() -> Self {
-        let path = ProjectDirs::from("org", "ShowMeFire", "Field")
-            .map(|d| d.config_dir().join("w3w.json"))
-            .unwrap_or_else(|| std::env::temp_dir().join("smf-field-w3w.json"));
-        Self::with_path(path)
-    }
-
-    fn with_path(path: PathBuf) -> Self {
-        let saved: Saved = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
-        // W3W_API_KEY is for scripted runs; a key saved in the app wins.
+        let saved: Saved = crate::store::load_json("w3w.json");
+        // W3W_API_KEY is for scripted runs (desktop); a key saved in the app wins.
+        #[cfg(not(target_arch = "wasm32"))]
+        let env_key = std::env::var("W3W_API_KEY").unwrap_or_default();
+        #[cfg(target_arch = "wasm32")]
+        let env_key = String::new();
         let key = if saved.key.is_empty() {
-            std::env::var("W3W_API_KEY").unwrap_or_default()
+            env_key
         } else {
             saved.key
         };
+        #[cfg(not(target_arch = "wasm32"))]
         let base = std::env::var("SMF_W3W_BASE").unwrap_or_else(|_| smf_w3w::DEFAULT_BASE.into());
+        #[cfg(target_arch = "wasm32")]
+        let base = smf_w3w::DEFAULT_BASE.to_string();
         let (tx, rx) = channel();
         let mut s = Self {
             key: String::new(),
             base,
             client: None,
-            path,
             dialog: false,
             key_edit: String::new(),
             query: String::new(),
@@ -121,16 +114,12 @@ impl W3wState {
         self.grid_box = None;
         self.hover = None;
         if persist {
-            if let Some(d) = self.path.parent() {
-                let _ = std::fs::create_dir_all(d);
-            }
-            let body = serde_json::to_vec_pretty(&Saved {
-                key: self.key.clone(),
-            })
-            .unwrap_or_default();
-            if let Err(e) = std::fs::write(&self.path, body) {
-                self.status = Some((format!("Could not save the key: {e}"), true));
-            }
+            crate::store::save_json(
+                "w3w.json",
+                &Saved {
+                    key: self.key.clone(),
+                },
+            );
         }
     }
 
@@ -234,8 +223,8 @@ impl MapPanel {
         }
         self.w3w.status = Some(("Searching...".into(), false));
         let (tx, ctx) = (self.w3w.tx.clone(), ctx.clone());
-        std::thread::spawn(move || {
-            let _ = tx.send(Msg::Search(client.to_square(&q)));
+        client.to_square(&q, move |r| {
+            let _ = tx.send(Msg::Search(r));
             ctx.request_repaint();
         });
     }
@@ -260,8 +249,8 @@ impl MapPanel {
             && let Some(client) = self.w3w.client.clone()
         {
             let (tx, ctx) = (self.w3w.tx.clone(), ctx.clone());
-            std::thread::spawn(move || {
-                let _ = tx.send(Msg::Hover(client.to_words(ll)));
+            client.to_words(ll, move |r| {
+                let _ = tx.send(Msg::Hover(r));
                 ctx.request_repaint();
             });
         }
@@ -357,8 +346,8 @@ impl MapPanel {
         }
         self.w3w.grid_inflight = true;
         let (tx, ctx) = (self.w3w.tx.clone(), ctx.clone());
-        std::thread::spawn(move || {
-            let _ = tx.send(Msg::Grid(b, client.grid(b)));
+        client.grid(b, move |r| {
+            let _ = tx.send(Msg::Grid(b, r));
             ctx.request_repaint();
         });
     }
@@ -400,8 +389,8 @@ impl MapPanel {
         {
             self.w3w.hover_inflight = true;
             let (tx, ctx) = (self.w3w.tx.clone(), ctx.clone());
-            std::thread::spawn(move || {
-                let _ = tx.send(Msg::Hover(client.to_words(ll)));
+            client.to_words(ll, move |r| {
+                let _ = tx.send(Msg::Hover(r));
                 ctx.request_repaint();
             });
         }
@@ -502,19 +491,18 @@ mod tests {
 
     #[test]
     fn key_is_saved_reloaded_and_removable() {
-        let dir = std::env::temp_dir().join(format!("smf-w3w-test-{}", std::process::id()));
-        let path = dir.join("w3w.json");
-        let _ = std::fs::remove_dir_all(&dir);
-        let mut a = W3wState::with_path(path.clone());
+        let dir = crate::store::use_temp_root("w3w");
+        let path = dir.join("config").join("w3w.json");
+        let mut a = W3wState::new();
         assert!(!a.has_key() || std::env::var_os("W3W_API_KEY").is_some());
         a.set_key("  secret-key  ".into(), true);
         assert!(a.has_key());
         // A new run finds the key saved by the dialog (trimmed), with no environment variable involved.
-        let b = W3wState::with_path(path.clone());
+        let b = W3wState::new();
         assert!(b.has_key());
         assert_eq!(b.key, "secret-key");
         // Removing the key empties the file, so the next run has none from disk.
-        let mut c = W3wState::with_path(path.clone());
+        let mut c = W3wState::new();
         c.set_key(String::new(), true);
         assert!(!c.has_key());
         let saved: Saved = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();

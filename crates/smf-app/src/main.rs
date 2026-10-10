@@ -11,6 +11,7 @@ mod overlay;
 mod panels;
 mod print_ui;
 mod smf_ui;
+mod store;
 mod team_ui;
 mod trails_ui;
 mod update;

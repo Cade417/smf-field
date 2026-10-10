@@ -7,6 +7,7 @@ use smf_data::{DataError, DataStyle};
 use smf_features::Geometry;
 use smf_geo::LngLat;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const NIFC_QUERY: &str = "https://services3.arcgis.com/T4QMspbfLg3qTGWY/arcgis/rest/services/InterAgencyFirePerimeterHistory_All_Years_View/FeatureServer/0/query";
@@ -23,10 +24,6 @@ pub struct ExtFeature {
     pub title: String,
     /// Extra lines for a details readout.
     pub lines: Vec<String>,
-}
-
-fn net(e: reqwest::Error) -> DataError {
-    DataError::Network(e.without_url().to_string())
 }
 
 fn parse_err(e: impl std::fmt::Display) -> DataError {
@@ -310,32 +307,32 @@ pub fn parse_snotel_data(text: &str, stations: &[&Station]) -> Result<Vec<ExtFea
 
 // ---------------------------------------------------------------- client
 
+/// Stations rarely change, so the list is kept for the whole session (and, natively, on disk).
+static STATIONS: Mutex<Option<Arc<Vec<Station>>>> = Mutex::new(None);
+
 pub struct ExtClient {
-    http: reqwest::blocking::Client,
-    cache_dir: PathBuf,
-    stations: Option<Vec<Station>>,
+    /// Where the station list is cached between runs (None on the web: memory only).
+    cache_dir: Option<PathBuf>,
+}
+
+type Done<T> = Box<dyn FnOnce(Result<T, DataError>) + Send + 'static>;
+
+fn get_text(url: &str, query: &[(&str, String)], done: Done<String>) {
+    let req = smf_net::Request::get(url)
+        .query(query)
+        .timeout(Duration::from_secs(40));
+    smf_net::fetch(req, move |r| {
+        done(match r {
+            Err(e) => Err(DataError::Network(e)),
+            Ok(resp) if !resp.ok() => Err(DataError::Status(resp.status)),
+            Ok(resp) => Ok(resp.text()),
+        })
+    });
 }
 
 impl ExtClient {
-    pub fn new(cache_dir: PathBuf) -> Result<Self, DataError> {
-        let http = reqwest::blocking::Client::builder()
-            .user_agent(concat!("ShowMeFireField/", env!("CARGO_PKG_VERSION")))
-            .timeout(Duration::from_secs(40))
-            .build()
-            .map_err(net)?;
-        Ok(Self {
-            http,
-            cache_dir,
-            stations: None,
-        })
-    }
-
-    fn get_text(&self, url: &str, query: &[(&str, String)]) -> Result<String, DataError> {
-        let r = self.http.get(url).query(query).send().map_err(net)?;
-        if !r.status().is_success() {
-            return Err(DataError::Status(r.status().as_u16()));
-        }
-        r.text().map_err(net)
+    pub fn new(cache_dir: Option<PathBuf>) -> Self {
+        Self { cache_dir }
     }
 
     /// Fire perimeters intersecting `bbox` ([west, south, east, north]).
@@ -343,76 +340,148 @@ impl ExtClient {
         &self,
         bbox: [f64; 4],
         now_unix: u64,
-    ) -> Result<Vec<ExtFeature>, DataError> {
+        done: impl FnOnce(Result<Vec<ExtFeature>, DataError>) + Send + 'static,
+    ) {
         // ~1/800 of the view width keeps shapes recognisable without megabytes of vertices.
         let tol = ((bbox[2] - bbox[0]).abs() / 800.0).max(0.00005);
-        let text = self.get_text(NIFC_QUERY, &fire_history_query(bbox, tol))?;
-        parse_fire_history(&text, year_of(now_unix))
+        get_text(
+            NIFC_QUERY,
+            &fire_history_query(bbox, tol),
+            Box::new(move |r| done(r.and_then(|t| parse_fire_history(&t, year_of(now_unix))))),
+        );
     }
 
-    fn load_stations(&mut self) -> Result<&[Station], DataError> {
-        if self.stations.is_none() {
-            let path = self.cache_dir.join("snotel_stations.json");
-            let fresh = std::fs::metadata(&path)
+    /// The station list: memory, then (natively) a fresh disk copy, then the network; an old
+    /// disk copy is used when the network fails.
+    fn stations(&self, done: Done<Arc<Vec<Station>>>) {
+        if let Some(s) = STATIONS.lock().ok().and_then(|g| g.clone()) {
+            return done(Ok(s));
+        }
+        let path = self
+            .cache_dir
+            .as_ref()
+            .map(|d| d.join("snotel_stations.json"));
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(p) = &path {
+            let fresh = std::fs::metadata(p)
                 .and_then(|m| m.modified())
                 .ok()
                 .and_then(|t| t.elapsed().ok())
                 .is_some_and(|age| age.as_secs() < STATION_MAX_AGE_SECS);
-            let cached = if fresh {
-                std::fs::read_to_string(&path).ok()
-            } else {
-                None
-            };
-            let text = match cached {
-                Some(t) => t,
-                None => match self.get_text(
-                    &format!("{AWDB}/stations"),
-                    &[("activeOnly", "true".into())],
-                ) {
+            if fresh
+                && let Ok(text) = std::fs::read_to_string(p)
+                && let Ok(list) = parse_stations(&text)
+            {
+                let list = Arc::new(list);
+                if let Ok(mut g) = STATIONS.lock() {
+                    *g = Some(list.clone());
+                }
+                return done(Ok(list));
+            }
+        }
+        get_text(
+            &format!("{AWDB}/stations"),
+            &[("activeOnly", "true".into())],
+            Box::new(move |r| {
+                let text = match r {
                     Ok(t) => {
-                        let _ = std::fs::create_dir_all(&self.cache_dir);
-                        let _ = std::fs::write(&path, &t);
+                        #[cfg(not(target_arch = "wasm32"))]
+                        if let Some(p) = &path {
+                            if let Some(d) = p.parent() {
+                                let _ = std::fs::create_dir_all(d);
+                            }
+                            let _ = std::fs::write(p, &t);
+                        }
                         t
                     }
-                    // Offline or the service is down: an old copy beats nothing.
-                    Err(e) => std::fs::read_to_string(&path).map_err(|_| e)?,
-                },
-            };
-            self.stations = Some(parse_stations(&text)?);
-        }
-        Ok(self.stations.as_deref().unwrap_or(&[]))
+                    Err(e) => {
+                        // Offline or the service is down: an old copy beats nothing.
+                        #[cfg(not(target_arch = "wasm32"))]
+                        if let Some(old) =
+                            path.as_ref().and_then(|p| std::fs::read_to_string(p).ok())
+                        {
+                            return finish_stations(old, done);
+                        }
+                        return done(Err(e));
+                    }
+                };
+                finish_stations(text, done)
+            }),
+        );
     }
 
     /// Latest readings for the SNOTEL sites inside `bbox`. Capped so a continent-wide view
     /// doesn't send an enormous request.
     pub fn snow_gauges(
-        &mut self,
+        &self,
         bbox: [f64; 4],
         now_unix: u64,
-    ) -> Result<Vec<ExtFeature>, DataError> {
+        done: impl FnOnce(Result<Vec<ExtFeature>, DataError>) + Send + 'static,
+    ) {
         const MAX_STATIONS: usize = 150;
-        let all = self.load_stations()?.to_vec();
-        let mut inside: Vec<&Station> = stations_in(&all, bbox);
-        inside.truncate(MAX_STATIONS);
-        if inside.is_empty() {
-            return Ok(vec![]);
+        self.stations(Box::new(move |r| {
+            let all = match r {
+                Ok(a) => a,
+                Err(e) => return done(Err(e)),
+            };
+            let mut inside: Vec<Station> = stations_in(&all, bbox).into_iter().cloned().collect();
+            inside.truncate(MAX_STATIONS);
+            if inside.is_empty() {
+                return done(Ok(vec![]));
+            }
+            let triplets = inside
+                .iter()
+                .map(|s| s.triplet.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
+            let query = [
+                ("stationTriplets", triplets),
+                ("elements", "WTEQ,SNWD".into()),
+                ("duration", "DAILY".into()),
+                ("beginDate", iso_date(now_unix.saturating_sub(4 * 86_400))),
+                ("endDate", iso_date(now_unix)),
+                ("periodRef", "END".into()),
+                ("returnFlags", "false".into()),
+            ];
+            get_text(
+                &format!("{AWDB}/data"),
+                &query,
+                Box::new(move |r| {
+                    done(r.and_then(|t| {
+                        let refs: Vec<&Station> = inside.iter().collect();
+                        parse_snotel_data(&t, &refs)
+                    }))
+                }),
+            );
+        }));
+    }
+
+    /// Blocking helpers for tools and tests (not available in browsers).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn snow_gauges_blocking(
+        &self,
+        bbox: [f64; 4],
+        now: u64,
+    ) -> Result<Vec<ExtFeature>, DataError> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.snow_gauges(bbox, now, move |r| {
+            let _ = tx.send(r);
+        });
+        rx.recv()
+            .unwrap_or(Err(DataError::Network("no reply".into())))
+    }
+}
+
+fn finish_stations(text: String, done: Done<Arc<Vec<Station>>>) {
+    match parse_stations(&text) {
+        Ok(list) => {
+            let list = Arc::new(list);
+            if let Ok(mut g) = STATIONS.lock() {
+                *g = Some(list.clone());
+            }
+            done(Ok(list));
         }
-        let triplets = inside
-            .iter()
-            .map(|s| s.triplet.as_str())
-            .collect::<Vec<_>>()
-            .join(",");
-        let query = [
-            ("stationTriplets", triplets),
-            ("elements", "WTEQ,SNWD".into()),
-            ("duration", "DAILY".into()),
-            ("beginDate", iso_date(now_unix.saturating_sub(4 * 86_400))),
-            ("endDate", iso_date(now_unix)),
-            ("periodRef", "END".into()),
-            ("returnFlags", "false".into()),
-        ];
-        let text = self.get_text(&format!("{AWDB}/data"), &query)?;
-        parse_snotel_data(&text, &inside)
+        Err(e) => done(Err(e)),
     }
 }
 

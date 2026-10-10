@@ -1,6 +1,7 @@
-//! Minimal blocking client for the public Show Me Fire API. No credentials are ever sent.
+//! Client for the public Show Me Fire API (callback style, see `smf-net`). No credentials are ever sent.
 
 use crate::layers::DataError;
+use smf_net::Request;
 use std::time::Duration;
 
 pub const DEFAULT_BASE: &str = "https://api.showmefire.org";
@@ -9,10 +10,14 @@ const MAX_BODY: usize = 64 * 1024 * 1024;
 
 /// SMF_API_BASE overrides the server (e.g. http://localhost:8000 for a dev API).
 pub fn default_base() -> String {
-    std::env::var("SMF_API_BASE")
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(b) = std::env::var("SMF_API_BASE")
         .ok()
         .and_then(|b| validate_base(&b).ok())
-        .unwrap_or_else(|| DEFAULT_BASE.to_owned())
+    {
+        return b;
+    }
+    DEFAULT_BASE.to_owned()
 }
 
 /// http(s) only, no trailing slash.
@@ -39,56 +44,81 @@ pub enum Fetched {
 #[derive(Clone)]
 pub struct SmfClient {
     pub base: String,
-    http: reqwest::blocking::Client,
 }
 
 impl SmfClient {
     pub fn new(base: &str) -> Result<Self, DataError> {
         let base = validate_base(base).map_err(DataError::Network)?;
-        let http = reqwest::blocking::Client::builder()
-            .user_agent(concat!("ShowMeFireField/", env!("CARGO_PKG_VERSION")))
-            .timeout(Duration::from_secs(25))
-            .build()
-            .map_err(|e| DataError::Network(e.to_string()))?;
-        Ok(Self { base, http })
+        Ok(Self { base })
     }
 
-    /// GET `path`, sending `If-None-Match` when we hold an ETag so unchanged data costs almost nothing.
-    pub fn get(&self, path: &str, etag: Option<&str>) -> Result<Fetched, DataError> {
-        let mut req = self.http.get(format!("{}{}", self.base, path));
+    /// GET `path`, sending `If-None-Match` when we hold an ETag so unchanged data costs almost
+    /// nothing. `done` runs on another thread (desktop) or the browser event loop (web).
+    pub fn get(
+        &self,
+        path: &str,
+        etag: Option<&str>,
+        done: impl FnOnce(Result<Fetched, DataError>) + Send + 'static,
+    ) {
+        let mut req =
+            Request::get(format!("{}{}", self.base, path)).timeout(Duration::from_secs(25));
         if let Some(e) = etag {
             req = req.header("If-None-Match", e);
         }
-        let resp = req.send().map_err(|e| DataError::Network(e.to_string()))?;
-        let status = resp.status();
-        if status.as_u16() == 304 {
-            return Ok(Fetched::NotModified);
-        }
-        if !status.is_success() {
-            return Err(DataError::Status(status.as_u16()));
-        }
-        let etag = resp
-            .headers()
-            .get("etag")
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_owned);
-        let bytes = resp
-            .bytes()
-            .map_err(|e| DataError::Network(e.to_string()))?;
-        if bytes.len() > MAX_BODY {
-            return Err(DataError::Parse("response is unreasonably large".into()));
-        }
-        let text = String::from_utf8(bytes.to_vec())
-            .map_err(|_| DataError::Parse("response is not UTF-8 text".into()))?;
-        Ok(Fetched::Body { text, etag })
+        smf_net::fetch(req, move |r| done(interpret(r)));
     }
 
-    pub fn get_text(&self, path: &str) -> Result<String, DataError> {
-        match self.get(path, None)? {
-            Fetched::Body { text, .. } => Ok(text),
-            Fetched::NotModified => Err(DataError::Status(304)),
-        }
+    pub fn get_text(
+        &self,
+        path: &str,
+        done: impl FnOnce(Result<String, DataError>) + Send + 'static,
+    ) {
+        self.get(path, None, move |r| {
+            done(match r {
+                Ok(Fetched::Body { text, .. }) => Ok(text),
+                Ok(Fetched::NotModified) => Err(DataError::Status(304)),
+                Err(e) => Err(e),
+            })
+        });
     }
+
+    /// Blocking variants for tests and tools (not available in browsers).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn get_blocking(&self, path: &str, etag: Option<&str>) -> Result<Fetched, DataError> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.get(path, etag, move |r| {
+            let _ = tx.send(r);
+        });
+        rx.recv()
+            .unwrap_or(Err(DataError::Network("no reply".into())))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn get_text_blocking(&self, path: &str) -> Result<String, DataError> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.get_text(path, move |r| {
+            let _ = tx.send(r);
+        });
+        rx.recv()
+            .unwrap_or(Err(DataError::Network("no reply".into())))
+    }
+}
+
+fn interpret(r: Result<smf_net::Response, String>) -> Result<Fetched, DataError> {
+    let resp = r.map_err(DataError::Network)?;
+    if resp.status == 304 {
+        return Ok(Fetched::NotModified);
+    }
+    if !resp.ok() {
+        return Err(DataError::Status(resp.status));
+    }
+    if resp.bytes.len() > MAX_BODY {
+        return Err(DataError::Parse("response is unreasonably large".into()));
+    }
+    let etag = resp.header("etag").map(str::to_owned);
+    let text = String::from_utf8(resp.bytes)
+        .map_err(|_| DataError::Parse("response is not UTF-8 text".into()))?;
+    Ok(Fetched::Body { text, etag })
 }
 
 #[cfg(test)]
@@ -214,7 +244,7 @@ mod tests {
     fn etag_roundtrip_and_304() {
         let s = serve("\"v1\"", r#"{"features":[]}"#);
         let c = SmfClient::new(&format!("http://127.0.0.1:{}", s.port)).unwrap();
-        let first = c.get("/x", None).unwrap();
+        let first = c.get_blocking("/x", None).unwrap();
         let etag = match &first {
             Fetched::Body { text, etag } => {
                 assert_eq!(text, r#"{"features":[]}"#);
@@ -223,12 +253,15 @@ mod tests {
             other => panic!("{other:?}"),
         };
         assert_eq!(etag, "\"v1\"");
-        assert_eq!(c.get("/x", Some(&etag)).unwrap(), Fetched::NotModified);
+        assert_eq!(
+            c.get_blocking("/x", Some(&etag)).unwrap(),
+            Fetched::NotModified
+        );
         assert_eq!(s.not_modified.load(Ordering::Relaxed), 1);
         // The data changes: the old ETag no longer matches, so the body comes back.
         *s.current.lock().unwrap() = ("\"v2\"".into(), r#"{"features":[1]}"#.into());
         assert!(matches!(
-            c.get("/x", Some(&etag)).unwrap(),
+            c.get_blocking("/x", Some(&etag)).unwrap(),
             Fetched::Body { .. }
         ));
     }
@@ -240,7 +273,7 @@ mod tests {
         let c = SmfClient::new(&default_base()).unwrap();
         for kind in crate::DataLayerKind::ALL {
             let text = c
-                .get_text(kind.path())
+                .get_text_blocking(kind.path())
                 .unwrap_or_else(|e| panic!("{}: {e}", kind.id()));
             let parsed =
                 crate::parse_layer(kind, &text).unwrap_or_else(|e| panic!("{}: {e}", kind.id()));
@@ -252,20 +285,22 @@ mod tests {
             );
             assert_eq!(parsed.skipped, 0, "{}", kind.id());
         }
-        let cat = crate::parse_catalog(&c.get_text("/api/conditions/layers").unwrap()).unwrap();
+        let cat =
+            crate::parse_catalog(&c.get_text_blocking("/api/conditions/layers").unwrap()).unwrap();
         assert!(cat.iter().any(|l| l.id == "fire_danger"));
         let cond = crate::parse_conditions(
-            &c.get_text("/api/conditions/at?lat=38.58&lon=-92.17")
+            &c.get_text_blocking("/api/conditions/at?lat=38.58&lon=-92.17")
                 .unwrap(),
         )
         .unwrap();
         assert!(!cond.values.is_empty());
         // ETag round trip against the real server (if it sends one).
-        if let Fetched::Body { etag: Some(e), .. } =
-            c.get("/api/burn-bans/active.geojson", None).unwrap()
+        if let Fetched::Body { etag: Some(e), .. } = c
+            .get_blocking("/api/burn-bans/active.geojson", None)
+            .unwrap()
         {
             assert!(matches!(
-                c.get("/api/burn-bans/active.geojson", Some(&e)),
+                c.get_blocking("/api/burn-bans/active.geojson", Some(&e)),
                 Ok(Fetched::NotModified | Fetched::Body { .. })
             ));
         }
@@ -276,9 +311,15 @@ mod tests {
         let s = serve("\"v\"", "{}");
         let c = SmfClient::new(&format!("http://127.0.0.1:{}", s.port)).unwrap();
         *s.status.lock().unwrap() = 503;
-        assert!(matches!(c.get("/x", None), Err(DataError::Status(503))));
+        assert!(matches!(
+            c.get_blocking("/x", None),
+            Err(DataError::Status(503))
+        ));
         // Nothing listens on port 9.
         let dead = SmfClient::new("http://127.0.0.1:9").unwrap();
-        assert!(matches!(dead.get("/x", None), Err(DataError::Network(_))));
+        assert!(matches!(
+            dead.get_blocking("/x", None),
+            Err(DataError::Network(_))
+        ));
     }
 }

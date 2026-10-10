@@ -6,7 +6,6 @@ use serde_json::Value;
 use smf_geo::{LngLat, distance_m};
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
-use std::time::Duration;
 
 /// Public Overpass servers, tried in order: any one of them is often busy.
 const OVERPASS: [&str; 3] = [
@@ -110,35 +109,47 @@ fn coord_key(p: &LngLat) -> i64 {
     -((x.wrapping_mul(0x9E37_79B1).wrapping_add(y)).abs() + 1)
 }
 
-pub fn fetch_trails(bbox: [f64; 4]) -> Result<Vec<Way>, String> {
-    let http = reqwest::blocking::Client::builder()
-        // The public Overpass servers ask clients to identify themselves.
-        .user_agent(concat!("ShowMeFireField/", env!("CARGO_PKG_VERSION")))
-        .timeout(Duration::from_secs(40))
-        .build()
-        .map_err(|e| e.to_string())?;
-    let mut last = String::from("no trail service is configured");
-    for url in OVERPASS {
-        match http
-            .get(url)
-            .query(&[("data", overpass_query(bbox))])
-            .send()
-        {
-            Ok(r) if r.status().is_success() => {
-                match r
-                    .text()
-                    .map_err(|e| e.to_string())
-                    .and_then(|t| parse_overpass(&t))
-                {
-                    Ok(w) => return Ok(w),
-                    Err(e) => last = e,
-                }
-            }
-            Ok(r) => last = format!("the trail service answered {}", r.status().as_u16()),
-            Err(e) => last = format!("could not reach the trail service ({})", e.without_url()),
-        }
-    }
-    Err(last)
+/// Fetch trails for `bbox`, trying each public Overpass server in turn until one answers.
+/// `done` runs once with the ways, or the last server's error.
+pub fn fetch_trails(bbox: [f64; 4], done: impl FnOnce(Result<Vec<Way>, String>) + Send + 'static) {
+    try_server(
+        0,
+        bbox,
+        String::from("no trail service is configured"),
+        Box::new(done),
+    );
+}
+
+type Done = Box<dyn FnOnce(Result<Vec<Way>, String>) + Send + 'static>;
+
+fn try_server(i: usize, bbox: [f64; 4], last: String, done: Done) {
+    let Some(url) = OVERPASS.get(i) else {
+        return done(Err(last));
+    };
+    let req = smf_net::Request::get(*url)
+        .query(&[("data", overpass_query(bbox))])
+        .timeout(std::time::Duration::from_secs(40));
+    smf_net::fetch(req, move |r| {
+        let err = match r {
+            Ok(resp) if resp.ok() => match parse_overpass(&resp.text()) {
+                Ok(w) => return done(Ok(w)),
+                Err(e) => e,
+            },
+            Ok(resp) => format!("the trail service answered {}", resp.status),
+            Err(e) => format!("could not reach the trail service ({e})"),
+        };
+        try_server(i + 1, bbox, err, done);
+    });
+}
+
+/// Blocking variant for tools and tests (not available in browsers).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn fetch_trails_blocking(bbox: [f64; 4]) -> Result<Vec<Way>, String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    fetch_trails(bbox, move |r| {
+        let _ = tx.send(r);
+    });
+    rx.recv().unwrap_or(Err("no reply".into()))
 }
 
 struct Edge {

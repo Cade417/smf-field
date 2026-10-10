@@ -4,13 +4,13 @@
 
 use crate::client::{Fetched, SmfClient};
 use crate::layers::{DataError, DataLayerKind, ParsedLayer, parse_layer};
-use crossbeam_channel::{Receiver, Sender, unbounded};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use web_time::{Instant, SystemTime, UNIX_EPOCH};
 
 pub fn unix_now() -> u64 {
     SystemTime::now()
@@ -41,10 +41,21 @@ impl DataCache {
         self.dir.join(format!("{}.json", kind.id()))
     }
 
+    // Browsers have no files: there the last copy simply is not kept between visits.
+    #[cfg(not(target_arch = "wasm32"))]
     fn load(&self, kind: DataLayerKind) -> Option<CacheFile> {
         serde_json::from_str(&std::fs::read_to_string(self.path(kind)).ok()?).ok()
     }
 
+    #[cfg(target_arch = "wasm32")]
+    fn load(&self, _kind: DataLayerKind) -> Option<CacheFile> {
+        None
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn store(&self, _kind: DataLayerKind, _f: &CacheFile) {}
+
+    #[cfg(not(target_arch = "wasm32"))]
     fn store(&self, kind: DataLayerKind, f: &CacheFile) {
         let _ = std::fs::create_dir_all(&self.dir);
         let tmp = self.path(kind).with_extension("json.tmp");
@@ -90,13 +101,25 @@ struct Slot {
     fails: u32,
     cache_loaded: bool,
     force: bool,
+    in_flight: bool,
 }
 
-/// Runs on its own thread; drop it to stop it.
+struct State {
+    slots: HashMap<DataLayerKind, Slot>,
+    offline: bool,
+    stopped: bool,
+}
+
+/// Keeps the enabled layers fresh. It has no thread of its own: call `tick()` every frame and
+/// it starts whatever fetch is due (requests finish through callbacks, see `smf-net`).
 pub struct Refresher {
-    tx: Sender<Command>,
+    state: Arc<Mutex<State>>,
+    client: SmfClient,
+    cache: DataCache,
+    wake: Arc<dyn Fn() + Send + Sync>,
+    interval_override: Option<Duration>,
+    tx: Sender<Update>,
     rx: Receiver<Update>,
-    stop: Arc<AtomicBool>,
 }
 
 /// Seconds between attempts: the layer's interval, doubled per consecutive failure up to 30 minutes.
@@ -109,142 +132,55 @@ impl Refresher {
     pub fn spawn(
         client: SmfClient,
         cache: DataCache,
-        wake: impl Fn() + Send + 'static,
+        wake: impl Fn() + Send + Sync + 'static,
         interval_override: Option<Duration>,
     ) -> Self {
-        let (cmd_tx, cmd_rx) = unbounded::<Command>();
-        let (up_tx, up_rx) = unbounded::<Update>();
-        let stop = Arc::new(AtomicBool::new(false));
-        let stop2 = stop.clone();
-        std::thread::spawn(move || {
-            let mut slots: HashMap<DataLayerKind, Slot> = HashMap::new();
-            let mut offline = false;
-            while !stop2.load(Ordering::Relaxed) {
-                while let Ok(c) = cmd_rx.try_recv() {
-                    match c {
-                        Command::SetEnabled(k, on) => {
-                            let s = slots.entry(k).or_insert(Slot {
-                                enabled: false,
-                                etag: None,
-                                last_attempt: None,
-                                last_ok_unix: None,
-                                fails: 0,
-                                cache_loaded: false,
-                                force: false,
-                            });
-                            s.enabled = on;
-                        }
-                        Command::RefreshNow => slots.values_mut().for_each(|s| s.force = true),
-                        Command::SetOffline(o) => {
-                            offline = o;
-                            // Back online: retry immediately instead of waiting out a long backoff.
-                            if !o {
-                                slots.values_mut().for_each(|s| {
-                                    s.force = true;
-                                    s.fails = 0;
-                                });
-                            }
-                        }
-                    }
-                }
-                for kind in DataLayerKind::ALL {
-                    let Some(slot) = slots.get_mut(&kind).filter(|s| s.enabled) else {
-                        continue;
-                    };
-                    // First time on: show the last good copy right away, then update it.
-                    if !slot.cache_loaded {
-                        slot.cache_loaded = true;
-                        if let Some(c) = cache.load(kind)
-                            && let Ok(parsed) = parse_layer(kind, &c.body)
-                        {
-                            slot.etag = c.etag;
-                            slot.last_ok_unix = Some(c.fetched_unix);
-                            let _ = up_tx.send(Update::Loaded {
-                                kind,
-                                parsed,
-                                fetched_unix: c.fetched_unix,
-                                from_cache: true,
-                            });
-                            wake();
-                        }
-                    }
-                    if offline {
-                        continue;
-                    }
-                    let base = interval_override
-                        .map(|d| d.as_secs_f64())
-                        .unwrap_or(kind.refresh_secs() as f64);
-                    let wait = Duration::from_secs_f64(base * f64::from(1u32 << slot.fails.min(4)))
-                        .min(Duration::from_secs(30 * 60));
-                    let due = slot.force || slot.last_attempt.is_none_or(|t| t.elapsed() >= wait);
-                    if !due {
-                        continue;
-                    }
-                    slot.force = false;
-                    slot.last_attempt = Some(Instant::now());
-                    let result =
-                        client
-                            .get(kind.path(), slot.etag.as_deref())
-                            .and_then(|f| match f {
-                                Fetched::NotModified => Ok(None),
-                                Fetched::Body { text, etag } => {
-                                    parse_layer(kind, &text).map(|p| Some((p, text, etag)))
-                                }
-                            });
-                    let msg = match result {
-                        Ok(None) => {
-                            slot.fails = 0;
-                            let now = unix_now();
-                            slot.last_ok_unix = Some(now);
-                            Update::Unchanged {
-                                kind,
-                                fetched_unix: now,
-                            }
-                        }
-                        Ok(Some((parsed, body, etag))) => {
-                            slot.fails = 0;
-                            let now = unix_now();
-                            slot.etag = etag.clone();
-                            slot.last_ok_unix = Some(now);
-                            cache.store(
-                                kind,
-                                &CacheFile {
-                                    etag,
-                                    fetched_unix: now,
-                                    body,
-                                },
-                            );
-                            Update::Loaded {
-                                kind,
-                                parsed,
-                                fetched_unix: now,
-                                from_cache: false,
-                            }
-                        }
-                        Err(e) => {
-                            slot.fails += 1;
-                            tracing::warn!("{} refresh failed: {e}", kind.id());
-                            Update::Failed {
-                                kind,
-                                error: describe(&e),
-                            }
-                        }
-                    };
-                    let _ = up_tx.send(msg);
-                    wake();
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
-        });
+        let (tx, rx) = channel::<Update>();
         Self {
-            tx: cmd_tx,
-            rx: up_rx,
-            stop,
+            state: Arc::new(Mutex::new(State {
+                slots: HashMap::new(),
+                offline: false,
+                stopped: false,
+            })),
+            client,
+            cache,
+            wake: Arc::new(wake),
+            interval_override,
+            tx,
+            rx,
         }
     }
 
     pub fn send(&self, c: Command) {
-        let _ = self.tx.send(c);
+        let Ok(mut st) = self.state.lock() else {
+            return;
+        };
+        match c {
+            Command::SetEnabled(k, on) => {
+                let s = st.slots.entry(k).or_insert(Slot {
+                    enabled: false,
+                    etag: None,
+                    last_attempt: None,
+                    last_ok_unix: None,
+                    fails: 0,
+                    cache_loaded: false,
+                    force: false,
+                    in_flight: false,
+                });
+                s.enabled = on;
+            }
+            Command::RefreshNow => st.slots.values_mut().for_each(|s| s.force = true),
+            Command::SetOffline(o) => {
+                st.offline = o;
+                // Back online: retry immediately instead of waiting out a long backoff.
+                if !o {
+                    st.slots.values_mut().for_each(|s| {
+                        s.force = true;
+                        s.fails = 0;
+                    });
+                }
+            }
+        }
     }
 
     pub fn set_enabled(&self, kind: DataLayerKind, on: bool) {
@@ -253,6 +189,122 @@ impl Refresher {
 
     pub fn try_recv(&self) -> Option<Update> {
         self.rx.try_recv().ok()
+    }
+
+    /// Start any fetch that is due. Cheap; call it every frame.
+    pub fn tick(&self) {
+        let mut start: Vec<(DataLayerKind, Option<String>)> = vec![];
+        {
+            let Ok(mut st) = self.state.lock() else {
+                return;
+            };
+            if st.stopped {
+                return;
+            }
+            let offline = st.offline;
+            for kind in DataLayerKind::ALL {
+                let Some(slot) = st.slots.get_mut(&kind).filter(|s| s.enabled) else {
+                    continue;
+                };
+                // First time on: show the last good copy right away, then update it.
+                if !slot.cache_loaded {
+                    slot.cache_loaded = true;
+                    if let Some(c) = self.cache.load(kind)
+                        && let Ok(parsed) = parse_layer(kind, &c.body)
+                    {
+                        slot.etag = c.etag;
+                        slot.last_ok_unix = Some(c.fetched_unix);
+                        let _ = self.tx.send(Update::Loaded {
+                            kind,
+                            parsed,
+                            fetched_unix: c.fetched_unix,
+                            from_cache: true,
+                        });
+                        (self.wake)();
+                    }
+                }
+                if offline || slot.in_flight {
+                    continue;
+                }
+                let base = self
+                    .interval_override
+                    .map(|d| d.as_secs_f64())
+                    .unwrap_or(kind.refresh_secs() as f64);
+                let wait = Duration::from_secs_f64(base * f64::from(1u32 << slot.fails.min(4)))
+                    .min(Duration::from_secs(30 * 60));
+                let due = slot.force || slot.last_attempt.is_none_or(|t| t.elapsed() >= wait);
+                if !due {
+                    continue;
+                }
+                slot.force = false;
+                slot.last_attempt = Some(Instant::now());
+                slot.in_flight = true;
+                start.push((kind, slot.etag.clone()));
+            }
+        }
+        for (kind, etag) in start {
+            let (state, tx, cache, wake) = (
+                self.state.clone(),
+                self.tx.clone(),
+                self.cache.clone(),
+                self.wake.clone(),
+            );
+            self.client.get(kind.path(), etag.as_deref(), move |res| {
+                let result = res.and_then(|f| match f {
+                    Fetched::NotModified => Ok(None),
+                    Fetched::Body { text, etag } => {
+                        parse_layer(kind, &text).map(|p| Some((p, text, etag)))
+                    }
+                });
+                let Ok(mut st) = state.lock() else { return };
+                let Some(slot) = st.slots.get_mut(&kind) else {
+                    return;
+                };
+                slot.in_flight = false;
+                let msg = match result {
+                    Ok(None) => {
+                        slot.fails = 0;
+                        let now = unix_now();
+                        slot.last_ok_unix = Some(now);
+                        Update::Unchanged {
+                            kind,
+                            fetched_unix: now,
+                        }
+                    }
+                    Ok(Some((parsed, body, etag))) => {
+                        slot.fails = 0;
+                        let now = unix_now();
+                        slot.etag = etag.clone();
+                        slot.last_ok_unix = Some(now);
+                        cache.store(
+                            kind,
+                            &CacheFile {
+                                etag,
+                                fetched_unix: now,
+                                body,
+                            },
+                        );
+                        Update::Loaded {
+                            kind,
+                            parsed,
+                            fetched_unix: now,
+                            from_cache: false,
+                        }
+                    }
+                    Err(e) => {
+                        slot.fails += 1;
+                        tracing::warn!("{} refresh failed: {e}", kind.id());
+                        Update::Failed {
+                            kind,
+                            error: describe(&e),
+                        }
+                    }
+                };
+                let _ = tx.send(msg);
+                drop(st);
+                wake();
+            });
+        }
     }
 }
 
@@ -265,7 +317,9 @@ fn describe(e: &DataError) -> String {
 
 impl Drop for Refresher {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
+        if let Ok(mut st) = self.state.lock() {
+            st.stopped = true;
+        }
     }
 }
 
@@ -291,6 +345,7 @@ mod tests {
 
     fn recv(r: &Refresher) -> Update {
         for _ in 0..400 {
+            r.tick();
             if let Some(u) = r.try_recv() {
                 return u;
             }
@@ -299,8 +354,17 @@ mod tests {
         panic!("timed out waiting for an update");
     }
 
+    /// Let time pass while ticking, as the app's frames do.
+    fn settle(r: &Refresher, ms: u64) {
+        let end = std::time::Instant::now() + Duration::from_millis(ms);
+        while std::time::Instant::now() < end {
+            r.tick();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     fn recv_none(r: &Refresher, ms: u64) -> bool {
-        std::thread::sleep(Duration::from_millis(ms));
+        settle(r, ms);
         r.try_recv().is_none()
     }
 
@@ -404,7 +468,7 @@ mod tests {
             }
         ));
         r.set_enabled(DataLayerKind::BurnBans, false);
-        std::thread::sleep(Duration::from_millis(250));
+        settle(&r, 250);
         while r.try_recv().is_some() {}
         let hits = s.hits.load(O::Relaxed);
         assert!(recv_none(&r, 400));
@@ -458,7 +522,7 @@ mod tests {
         assert!(matches!(recv(&r), Update::Failed { .. }));
         // Explicit offline mode makes no attempts at all.
         r.send(Command::SetOffline(true));
-        std::thread::sleep(Duration::from_millis(100));
+        settle(&r, 100);
         while r.try_recv().is_some() {}
         assert!(
             recv_none(&r, 500),

@@ -136,17 +136,21 @@ impl MapPanel {
         let bbox = limit_span(grow(want, 1.3));
         self.trails.inflight = true;
         let (tx, ctx, zoom) = (self.trails.tx.clone(), ctx.clone(), self.view.zoom);
-        std::thread::spawn(move || {
-            // SMF_TRAILS_FILE: read an Overpass JSON reply from disk instead of the network.
-            let r = match std::env::var("SMF_TRAILS_FILE") {
-                Ok(f) => std::fs::read_to_string(&f)
-                    .map_err(|e| e.to_string())
-                    .and_then(|t| smf_route::parse_overpass(&t)),
-                Err(_) => fetch_trails(bbox),
-            };
+        let send = move |r: Result<Vec<Way>, String>| {
             let _ = tx.send((bbox, zoom, r));
             ctx.request_repaint();
-        });
+        };
+        // SMF_TRAILS_FILE (development only): read an Overpass JSON reply from disk instead of the network.
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Ok(f) = std::env::var("SMF_TRAILS_FILE") {
+            send(
+                std::fs::read_to_string(&f)
+                    .map_err(|e| e.to_string())
+                    .and_then(|t| smf_route::parse_overpass(&t)),
+            );
+            return;
+        }
+        fetch_trails(bbox, send);
     }
 
     /// A drawing click: with trail snapping on, the point (and the path from the previous

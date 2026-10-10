@@ -223,15 +223,16 @@ impl MapPanel {
             let bbox = grow(want, 1.5);
             l.inflight = true;
             let (tx, ctx) = (self.ext.tx.clone(), ctx.clone());
-            std::thread::spawn(move || {
-                let now = smf_data::unix_now();
-                let r = ExtClient::new(cache_dir).and_then(|mut c| match k {
-                    ExtKind::FireHistory => c.fire_history(bbox, now),
-                    ExtKind::SnowGauges => c.snow_gauges(bbox, now),
-                });
+            let now = smf_data::unix_now();
+            let client = ExtClient::new(Some(cache_dir));
+            let done = move |r: Result<Vec<ExtFeature>, DataError>| {
                 let _ = tx.send((k, bbox, zoom, r));
                 ctx.request_repaint();
-            });
+            };
+            match k {
+                ExtKind::FireHistory => client.fire_history(bbox, now, done),
+                ExtKind::SnowGauges => client.snow_gauges(bbox, now, done),
+            }
         }
     }
 

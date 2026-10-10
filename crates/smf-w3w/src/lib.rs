@@ -176,7 +176,6 @@ fn api_error(status: u16, body: &str) -> W3wError {
 pub struct W3wClient {
     base: String,
     key: String,
-    http: reqwest::blocking::Client,
 }
 
 impl std::fmt::Debug for W3wClient {
@@ -185,6 +184,8 @@ impl std::fmt::Debug for W3wClient {
         write!(f, "W3wClient({})", self.base)
     }
 }
+
+type Done<T> = Box<dyn FnOnce(Result<T, W3wError>) + Send + 'static>;
 
 impl W3wClient {
     pub fn new(base: &str, key: &str) -> Result<Self, W3wError> {
@@ -198,56 +199,103 @@ impl W3wClient {
                 "what3words server address must be http(s)".into(),
             ));
         }
-        let http = reqwest::blocking::Client::builder()
-            .user_agent(concat!("ShowMeFireField/", env!("CARGO_PKG_VERSION")))
-            .timeout(Duration::from_secs(15))
-            .build()
-            .map_err(|e| W3wError::Network(e.to_string()))?;
         Ok(Self {
             base,
             key: key.to_string(),
-            http,
         })
     }
 
-    fn get(&self, path: &str, query: &[(&str, String)]) -> Result<String, W3wError> {
-        let resp = self
-            .http
-            .get(format!("{}{}", self.base, path))
-            .header("X-Api-Key", &self.key)
+    fn get(&self, path: &str, query: &[(&str, String)], done: Done<String>) {
+        let req = smf_net::Request::get(format!("{}{}", self.base, path))
             .query(query)
-            .send()
-            .map_err(|e| W3wError::Network(e.without_url().to_string()))?;
-        let status = resp.status().as_u16();
-        let body = resp
-            .text()
-            .map_err(|e| W3wError::Network(e.without_url().to_string()))?;
-        if status == 200 {
-            Ok(body)
-        } else {
-            Err(api_error(status, &body))
+            .header("X-Api-Key", &self.key)
+            .timeout(Duration::from_secs(15));
+        smf_net::fetch(req, move |r| {
+            done(match r {
+                Err(e) => Err(W3wError::Network(e)),
+                Ok(resp) if resp.status == 200 => Ok(resp.text()),
+                Ok(resp) => Err(api_error(resp.status, &resp.text())),
+            })
+        });
+    }
+
+    /// Words to a square. `done` runs on another thread (natively) or the browser event loop.
+    pub fn to_square(
+        &self,
+        words: &str,
+        done: impl FnOnce(Result<Square, W3wError>) + Send + 'static,
+    ) {
+        match normalize(words) {
+            Err(e) => done(Err(e)),
+            Ok(w) => self.get(
+                "/v3/convert-to-coordinates",
+                &[("words", w)],
+                Box::new(move |r| done(r.and_then(|t| parse_square(&t)))),
+            ),
         }
     }
 
-    pub fn to_square(&self, words: &str) -> Result<Square, W3wError> {
-        let words = normalize(words)?;
-        parse_square(&self.get("/v3/convert-to-coordinates", &[("words", words)])?)
-    }
-
-    pub fn to_words(&self, p: LngLat) -> Result<Square, W3wError> {
+    pub fn to_words(
+        &self,
+        p: LngLat,
+        done: impl FnOnce(Result<Square, W3wError>) + Send + 'static,
+    ) {
         let c = format!("{:.6},{:.6}", p.lat, p.lng);
-        parse_square(&self.get("/v3/convert-to-3wa", &[("coordinates", c)])?)
+        self.get(
+            "/v3/convert-to-3wa",
+            &[("coordinates", c)],
+            Box::new(move |r| done(r.and_then(|t| parse_square(&t)))),
+        );
     }
 
     /// Grid lines inside the box `[west, south, east, north]`; the caller keeps it within
     /// `MAX_GRID_DIAGONAL_M` (see `clamp_grid_box`).
-    pub fn grid(&self, bbox: [f64; 4]) -> Result<Vec<Line>, W3wError> {
+    pub fn grid(
+        &self,
+        bbox: [f64; 4],
+        done: impl FnOnce(Result<Vec<Line>, W3wError>) + Send + 'static,
+    ) {
         // The API wants south_lat,west_lng,north_lat,east_lng.
         let b = format!(
             "{:.6},{:.6},{:.6},{:.6}",
             bbox[1], bbox[0], bbox[3], bbox[2]
         );
-        parse_grid(&self.get("/v3/grid-section", &[("bounding-box", b)])?)
+        self.get(
+            "/v3/grid-section",
+            &[("bounding-box", b)],
+            Box::new(move |r| done(r.and_then(|t| parse_grid(&t)))),
+        );
+    }
+
+    /// Blocking helpers for tests and tools (not available in browsers).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn to_square_blocking(&self, words: &str) -> Result<Square, W3wError> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.to_square(words, move |r| {
+            let _ = tx.send(r);
+        });
+        rx.recv()
+            .unwrap_or(Err(W3wError::Network("no reply".into())))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn to_words_blocking(&self, p: LngLat) -> Result<Square, W3wError> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.to_words(p, move |r| {
+            let _ = tx.send(r);
+        });
+        rx.recv()
+            .unwrap_or(Err(W3wError::Network("no reply".into())))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn grid_blocking(&self, bbox: [f64; 4]) -> Result<Vec<Line>, W3wError> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.grid(bbox, move |r| {
+            let _ = tx.send(r);
+        });
+        rx.recv()
+            .unwrap_or(Err(W3wError::Network("no reply".into())))
     }
 }
 
@@ -339,7 +387,7 @@ mod tests {
     fn converts_words_and_sends_key_in_header_only() {
         let (port, seen) = serve(200, CONVERT);
         let c = W3wClient::new(&format!("http://127.0.0.1:{port}"), "SECRETKEY").unwrap();
-        let sq = c.to_square("///Filled.Count.Soap").unwrap();
+        let sq = c.to_square_blocking("///Filled.Count.Soap").unwrap();
         assert_eq!(sq.words, "filled.count.soap");
         assert_eq!(sq.nearest_place, "Bayswater, London");
         assert!(sq.contains(sq.center));
@@ -359,7 +407,8 @@ mod tests {
     fn position_to_words_and_grid_box_order() {
         let (port, seen) = serve(200, CONVERT);
         let c = W3wClient::new(&format!("http://127.0.0.1:{port}"), "k").unwrap();
-        c.to_words(LngLat::new(-0.195521, 51.520847)).unwrap();
+        c.to_words_blocking(LngLat::new(-0.195521, 51.520847))
+            .unwrap();
         let l = seen.lock().unwrap()[0].0.clone();
         assert!(
             l.contains("coordinates=51.520847%2C-0.195521")
@@ -369,7 +418,7 @@ mod tests {
 
         let (port, seen) = serve(200, GRID);
         let c = W3wClient::new(&format!("http://127.0.0.1:{port}"), "k").unwrap();
-        let lines = c.grid([-0.2, 51.5, -0.19, 51.51]).unwrap();
+        let lines = c.grid_blocking([-0.2, 51.5, -0.19, 51.51]).unwrap();
         assert_eq!(lines.len(), 2);
         let l = seen.lock().unwrap()[0].0.clone();
         assert!(
@@ -409,7 +458,9 @@ mod tests {
     fn end_to_end_error_and_missing_key() {
         let (port, _) = serve(401, r#"{"error":{"code":"InvalidKey","message":"bad"}}"#);
         let c = W3wClient::new(&format!("http://127.0.0.1:{port}"), "k").unwrap();
-        assert!(matches!(c.to_square("a.b.c"), Err(W3wError::Api(m)) if m.contains("API key")));
+        assert!(
+            matches!(c.to_square_blocking("a.b.c"), Err(W3wError::Api(m)) if m.contains("API key"))
+        );
         assert_eq!(
             W3wClient::new(DEFAULT_BASE, "  ").unwrap_err(),
             W3wError::NoKey
@@ -417,7 +468,7 @@ mod tests {
         assert!(W3wClient::new("ftp://x", "k").is_err());
         // Nothing listening: a message, not a panic, and it never contains the key.
         let c = W3wClient::new("http://127.0.0.1:9", "TOPSECRET").unwrap();
-        let e = c.to_square("a.b.c").unwrap_err().to_string();
+        let e = c.to_square_blocking("a.b.c").unwrap_err().to_string();
         assert!(
             e.contains("could not reach") && !e.contains("TOPSECRET"),
             "{e}"

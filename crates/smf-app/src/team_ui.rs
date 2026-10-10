@@ -5,19 +5,18 @@
 
 use crate::map_panel::MapPanel;
 use crate::overlay::{self, Projector};
-use directories::ProjectDirs;
 use eframe::egui::{self, Align2, Color32};
 use serde::{Deserialize, Serialize};
 use smf_features::Editor;
 use smf_geo::LngLat;
 use smf_sync::{
-    Command, Creds, FieldClient, Handle, MapDoc, MapInfo, Me, Position, SyncState, TeamPosition,
-    Update,
+    Command, Creds, FieldClient, Handle, MapDoc, MapInfo, Me, Position, SyncError, SyncState,
+    TeamPosition, Update,
 };
 use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use web_time::Instant;
 
 /// How often local edits are compared with what the server has.
 const DIFF_EVERY: Duration = Duration::from_millis(300);
@@ -73,7 +72,6 @@ struct Session {
 
 pub struct TeamState {
     saved: Saved,
-    path: PathBuf,
     client: Option<FieldClient>,
     me: Option<Me>,
     maps: Vec<MapInfo>,
@@ -89,6 +87,8 @@ pub struct TeamState {
     confirm_replace: Option<String>,
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
+    /// Lets session callbacks ask for a repaint (set every frame).
+    ctx: Option<egui::Context>,
     /// Verification hook (SMF_TEAM=url|code|name[|map name]): join and open a map at startup.
     pub dev: Option<(String, String, String, Option<String>)>,
     dev_open_map: Option<String>,
@@ -100,13 +100,7 @@ fn default_server() -> String {
 
 impl TeamState {
     pub fn new() -> Self {
-        let path = ProjectDirs::from("org", "ShowMeFire", "Field")
-            .map(|d| d.config_dir().join("team.json"))
-            .unwrap_or_else(|| std::env::temp_dir().join("smf-field-team.json"));
-        let saved: Saved = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
+        let saved: Saved = crate::store::load_json("team.json");
         let (tx, rx) = channel();
         let mut s = Self {
             form: Form {
@@ -119,7 +113,6 @@ impl TeamState {
                 ..Form::default()
             },
             saved,
-            path,
             client: None,
             me: None,
             maps: vec![],
@@ -133,6 +126,7 @@ impl TeamState {
             confirm_replace: None,
             tx,
             rx,
+            ctx: None,
             dev: None,
             dev_open_map: None,
         };
@@ -141,12 +135,7 @@ impl TeamState {
     }
 
     fn save(&self) {
-        if let Some(d) = self.path.parent() {
-            let _ = std::fs::create_dir_all(d);
-        }
-        if let Ok(b) = serde_json::to_vec_pretty(&self.saved) {
-            let _ = std::fs::write(&self.path, b);
-        }
+        crate::store::save_json("team.json", &self.saved);
     }
 
     /// Resume a saved sign-in: check the token still works before relying on it.
@@ -158,8 +147,8 @@ impl TeamState {
             Ok(c) => {
                 self.client = Some(c.clone());
                 let tx = self.tx.clone();
-                std::thread::spawn(move || {
-                    let _ = tx.send(Msg::Me(c.me().map_err(|e| e.to_string())));
+                c.me(move |r| {
+                    let _ = tx.send(Msg::Me(r.map_err(|e| e.to_string())));
                 });
             }
             Err(e) => self.status = Some(e.to_string()),
@@ -170,23 +159,30 @@ impl TeamState {
         self.client.is_some()
     }
 
+    /// Start a request; when it finishes the result is mapped to a `Msg` and the UI repaints.
     fn task<T: Send + 'static>(
         &self,
         ctx: &egui::Context,
-        f: impl FnOnce() -> T + Send + 'static,
-        wrap: impl FnOnce(T) -> Msg + Send + 'static,
+        start: impl FnOnce(Box<dyn FnOnce(Result<T, SyncError>) + Send>),
+        wrap: impl FnOnce(Result<T, String>) -> Msg + Send + 'static,
     ) {
         let (tx, ctx) = (self.tx.clone(), ctx.clone());
-        std::thread::spawn(move || {
-            let _ = tx.send(wrap(f()));
+        start(Box::new(move |r| {
+            let _ = tx.send(wrap(r.map_err(|e| e.to_string())));
             ctx.request_repaint();
-        });
+        }));
     }
 
     fn start_session(&mut self, map: Option<(String, String)>, rev: u64, state: SyncState) {
         let Some(c) = self.client.clone() else { return };
+        let ctx = self.ctx.clone();
+        let wake = move || {
+            if let Some(c) = &ctx {
+                c.request_repaint();
+            }
+        };
         self.session = Some(Session {
-            handle: smf_sync::spawn(c, map.as_ref().map(|m| m.0.clone()), rev, 0),
+            handle: smf_sync::spawn(c, map.as_ref().map(|m| m.0.clone()), rev, 0, wake),
             map,
             state,
             last_diff: Instant::now(),
@@ -201,8 +197,8 @@ impl TeamState {
             && let Some(s) = &self.session
         {
             s.handle.send(Command::ClearPosition);
-            // Give the writer a moment to send it before the handle drops.
-            std::thread::sleep(Duration::from_millis(300));
+            // Start the request now; it completes even though the session is dropped below.
+            s.handle.tick();
         }
         self.session = None;
         self.client = None;
@@ -269,11 +265,7 @@ impl MapPanel {
                         {
                             let (c, id) = (t.client.clone(), m.id.clone());
                             if let Some(c) = c {
-                                t.task(
-                                    &ctx,
-                                    move || c.remove_member(&id).map_err(|e| e.to_string()),
-                                    Msg::Done,
-                                );
+                                t.task(&ctx, move |d| c.remove_member(&id, d), Msg::Done);
                             }
                         }
                     });
@@ -283,11 +275,7 @@ impl MapPanel {
                 if ui.button("New join code").clicked()
                     && let Some(c) = t.client.clone()
                 {
-                    t.task(
-                        &ctx,
-                        move || c.new_join_code().map_err(|e| e.to_string()),
-                        Msg::JoinCode,
-                    );
+                    t.task(&ctx, move |d| c.new_join_code(d), Msg::JoinCode);
                 }
                 if let Some(code) = &t.new_code {
                     ui.horizontal(|ui| {
@@ -321,16 +309,13 @@ impl MapPanel {
             let name = editor.project.name.clone();
             let mut tmp = SyncState::default();
             let snap = smf_sync::snapshot(&editor.project, &mut tmp);
+            let snap_for_call = snap.clone();
             if let Some(c) = t.client.clone() {
                 t.status = Some("Sharing...".into());
                 t.task(
                     &ctx,
-                    move || {
-                        c.create_map(&name, &snap)
-                            .map(|i| (i, snap))
-                            .map_err(|e| e.to_string())
-                    },
-                    Msg::Shared,
+                    move |d| c.create_map(&name, &snap_for_call, d),
+                    move |r| Msg::Shared(r.map(|i| (i, snap))),
                 );
                 // `tmp` carried the uids; keep it so the content matches what was uploaded.
                 t.pending_share = Some(tmp);
@@ -342,11 +327,7 @@ impl MapPanel {
             if ui.small_button("Refresh").clicked()
                 && let Some(c) = t.client.clone()
             {
-                t.task(
-                    &ctx,
-                    move || c.list_maps().map_err(|e| e.to_string()),
-                    Msg::Maps,
-                );
+                t.task(&ctx, move |d| c.list_maps(d), Msg::Maps);
             }
         });
         if t.maps.is_empty() {
@@ -366,11 +347,7 @@ impl MapPanel {
                         t.confirm_replace = None;
                         if let Some(c) = t.client.clone() {
                             let id = m.id.clone();
-                            t.task(
-                                &ctx,
-                                move || c.get_map(&id).map_err(|e| e.to_string()),
-                                Msg::Opened,
-                            );
+                            t.task(&ctx, move |d| c.get_map(&id, d), Msg::Opened);
                         }
                     }
                 }
@@ -483,15 +460,14 @@ impl TeamState {
         }
         self.status = Some("Joining...".into());
         let (s2, shown_name) = (server.clone(), name.clone());
-        self.task(
-            ctx,
-            move || {
-                FieldClient::new(&server, None)
-                    .and_then(|c| c.join(&code, &name))
-                    .map_err(|e| e.to_string())
-            },
-            move |r| Msg::SignedIn(r, s2, shown_name),
-        );
+        match FieldClient::new(&server, None) {
+            Ok(c) => self.task(
+                ctx,
+                move |d| c.join(&code, &name, d),
+                move |r| Msg::SignedIn(r, s2, shown_name),
+            ),
+            Err(e) => self.status = Some(e.to_string()),
+        }
     }
 
     fn begin_create(
@@ -509,15 +485,14 @@ impl TeamState {
         self.status = Some("Creating...".into());
         let s2 = server.clone();
         let name2 = name.clone();
-        self.task(
-            ctx,
-            move || {
-                FieldClient::new(&server, None)
-                    .and_then(|c| c.create_team(&key, &team, &name))
-                    .map_err(|e| e.to_string())
-            },
-            move |r| Msg::SignedIn(r, s2, name2),
-        );
+        match FieldClient::new(&server, None) {
+            Ok(c) => self.task(
+                ctx,
+                move |d| c.create_team(&key, &team, &name, d),
+                move |r| Msg::SignedIn(r, s2, name2),
+            ),
+            Err(e) => self.status = Some(e.to_string()),
+        }
     }
 }
 
@@ -525,6 +500,10 @@ impl MapPanel {
     /// Called every frame: handles finished background tasks, syncs local edits, applies
     /// teammates' changes and shares our position.
     pub(crate) fn team_tick(&mut self, ctx: &egui::Context, editor: &mut Editor) {
+        self.team.ctx = Some(ctx.clone());
+        if let Some(s) = &self.team.session {
+            s.handle.tick();
+        }
         if let Some((server, code, name, map)) = self.team.dev.take() {
             self.team.dev_open_map = map;
             self.team.begin_join(ctx, server, code, name);
@@ -599,11 +578,7 @@ impl MapPanel {
         if reload && let Some((id, _)) = sess.map.clone() {
             sess.reloading = true;
             if let Some(c) = self.team.client.clone() {
-                self.team.task(
-                    ctx,
-                    move || c.get_map(&id).map_err(|e| e.to_string()),
-                    Msg::Opened,
-                );
+                self.team.task(ctx, move |d| c.get_map(&id, d), Msg::Opened);
             }
         }
 
@@ -656,12 +631,8 @@ impl MapPanel {
                 t.start_session(None, 0, SyncState::default());
                 if let Some(cl) = t.client.clone() {
                     let cl2 = cl.clone();
-                    t.task(ctx, move || cl.me().map_err(|e| e.to_string()), Msg::Me);
-                    t.task(
-                        ctx,
-                        move || cl2.list_maps().map_err(|e| e.to_string()),
-                        Msg::Maps,
-                    );
+                    t.task(ctx, move |d| cl.me(d), Msg::Me);
+                    t.task(ctx, move |d| cl2.list_maps(d), Msg::Maps);
                 }
             }
             Msg::SignedIn(Err(e), ..) => t.status = Some(e),
@@ -673,11 +644,7 @@ impl MapPanel {
                     t.start_session(None, 0, SyncState::default());
                 }
                 if let Some(c) = t.client.clone() {
-                    t.task(
-                        ctx,
-                        move || c.list_maps().map_err(|e| e.to_string()),
-                        Msg::Maps,
-                    );
+                    t.task(ctx, move |d| c.list_maps(d), Msg::Maps);
                 }
             }
             Msg::Me(Err(e)) => {
@@ -693,11 +660,7 @@ impl MapPanel {
                     && let Some(c) = t.client.clone()
                 {
                     let id = m.id.clone();
-                    t.task(
-                        ctx,
-                        move || c.get_map(&id).map_err(|e| e.to_string()),
-                        Msg::Opened,
-                    );
+                    t.task(ctx, move |d| c.get_map(&id, d), Msg::Opened);
                 }
                 t.maps = maps;
             }
@@ -745,11 +708,7 @@ impl MapPanel {
                     info.name
                 ));
                 if let Some(c) = t.client.clone() {
-                    t.task(
-                        ctx,
-                        move || c.list_maps().map_err(|e| e.to_string()),
-                        Msg::Maps,
-                    );
+                    t.task(ctx, move |d| c.list_maps(d), Msg::Maps);
                 }
             }
             Msg::Shared(Err(e)) => {
@@ -760,7 +719,7 @@ impl MapPanel {
             Msg::JoinCode(Err(e)) | Msg::Done(Err(e)) => t.status = Some(e),
             Msg::Done(Ok(())) => {
                 if let Some(c) = t.client.clone() {
-                    t.task(ctx, move || c.me().map_err(|e| e.to_string()), Msg::Me);
+                    t.task(ctx, move |d| c.me(d), Msg::Me);
                 }
             }
         }

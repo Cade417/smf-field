@@ -10,7 +10,7 @@ use smf_features::{Feature, Geometry, Project, Style};
 use smf_geo::LngLat;
 use smf_sync::{
     Command, FieldClient, Handle, Position, SyncState, Update, ack_snapshot, apply_remote, diff,
-    load_full, snapshot, spawn,
+    load_full, snapshot, spawn, wait_blocking,
 };
 use std::time::{Duration, Instant};
 
@@ -43,6 +43,7 @@ impl Peer {
     fn pump(&mut self, secs: u64, done: impl Fn(&Peer) -> bool) {
         let end = Instant::now() + Duration::from_secs(secs);
         while Instant::now() < end && !done(self) {
+            self.handle.tick();
             let ops = diff(&self.project, &mut self.state);
             if !ops.is_empty() {
                 self.handle.send(Command::Push(ops));
@@ -98,12 +99,12 @@ fn two_clients_converge_through_a_real_server() {
     let anon = FieldClient::new(&url, None).unwrap();
 
     // Alice creates the team; Bob joins with the code.
-    let alice_creds = anon.create_team(&key, "E2E crew", "Alice").unwrap();
+    let alice_creds = wait_blocking(|d| anon.create_team(&key, "E2E crew", "Alice", d)).unwrap();
     let code = alice_creds.join_code.clone().unwrap();
-    let bob_creds = anon.join(&code, "Bob").unwrap();
+    let bob_creds = wait_blocking(|d| anon.join(&code, "Bob", d)).unwrap();
     let alice_client = FieldClient::new(&url, Some(alice_creds.token.clone())).unwrap();
     let bob_client = FieldClient::new(&url, Some(bob_creds.token.clone())).unwrap();
-    let me = alice_client.me().unwrap();
+    let me = wait_blocking(|d| alice_client.me(d)).unwrap();
     assert_eq!(
         (me.team_name.as_str(), me.members.len(), me.is_owner),
         ("E2E crew", 2, true)
@@ -117,12 +118,12 @@ fn two_clients_converge_through_a_real_server() {
         ..Project::default()
     };
     let snap = snapshot(&a_project, &mut a_state);
-    let info = alice_client.create_map("Search area", &snap).unwrap();
+    let info = wait_blocking(|d| alice_client.create_map("Search area", &snap, d)).unwrap();
     ack_snapshot(&mut a_state, &snap);
     assert_eq!(info.rev, 2);
 
     // Bob opens it.
-    let doc = bob_client.get_map(&info.id).unwrap();
+    let doc = wait_blocking(|d| bob_client.get_map(&info.id, d)).unwrap();
     let mut b_state = SyncState::default();
     let mut b_project = Project::default();
     assert_eq!(load_full(&mut b_project, &mut b_state, &doc), 2);
@@ -131,7 +132,13 @@ fn two_clients_converge_through_a_real_server() {
         me: alice_creds.member_id.clone(),
         project: a_project,
         state: a_state,
-        handle: spawn(alice_client.clone(), Some(info.id.clone()), info.rev, 0),
+        handle: spawn(
+            alice_client.clone(),
+            Some(info.id.clone()),
+            info.rev,
+            0,
+            || {},
+        ),
         positions: vec![],
         logged_out: None,
         pushed: 0,
@@ -140,7 +147,7 @@ fn two_clients_converge_through_a_real_server() {
         me: bob_creds.member_id.clone(),
         project: b_project,
         state: b_state,
-        handle: spawn(bob_client.clone(), Some(info.id.clone()), doc.rev, 0),
+        handle: spawn(bob_client.clone(), Some(info.id.clone()), doc.rev, 0, || {}),
         positions: vec![],
         logged_out: None,
         pushed: 0,
@@ -186,7 +193,7 @@ fn two_clients_converge_through_a_real_server() {
     assert!(left.is_empty(), "Bob still has to send: {left:?}");
 
     // The server's copy matches too.
-    let server = alice_client.get_map(&info.id).unwrap();
+    let server = wait_blocking(|d| alice_client.get_map(&info.id, d)).unwrap();
     let mut on_server: Vec<String> = server
         .features
         .values()
@@ -211,8 +218,8 @@ fn two_clients_converge_through_a_real_server() {
     assert!(alice.positions.is_empty(), "Bob stopped sharing");
 
     // Alice removes Bob: his credentials stop working and his worker reports it.
-    alice_client.remove_member(&bob_creds.member_id).unwrap();
+    wait_blocking(|d| alice_client.remove_member(&bob_creds.member_id, d)).unwrap();
     bob.pump(30, |p| p.logged_out.is_some());
     assert!(bob.logged_out.is_some(), "Bob should be logged out");
-    assert!(bob_client.me().is_err());
+    assert!(wait_blocking(|d| bob_client.me(d)).is_err());
 }

@@ -16,8 +16,8 @@ use smf_data::{
 use smf_features::{Editor, GeoHit, geometry_hit};
 use smf_geo::LngLat;
 use std::collections::HashMap;
-use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use web_time::Instant;
 
 /// Raster overlays opened by default the first time: the headline Show Me Fire product.
 const DEFAULT_RASTER: (&str, f32) = ("fire_danger", 0.45);
@@ -65,8 +65,6 @@ pub struct SmfState {
     pub forecast: ForecastUi,
     pub info: Option<DataFeature>,
     prefs: Prefs,
-    prefs_path: PathBuf,
-    cache_dir: PathBuf,
     pending_rasters: Vec<(String, f32)>,
     cond_rx: Receiver<(LngLat, Result<String, String>)>,
     cond_tx: Sender<(LngLat, Result<String, String>)>,
@@ -83,19 +81,14 @@ pub struct SmfState {
 
 impl SmfState {
     pub fn new(ctx: &egui::Context) -> Self {
-        let dirs = ProjectDirs::from("org", "ShowMeFire", "Field");
-        let cache_dir = dirs
-            .as_ref()
+        #[cfg(not(target_arch = "wasm32"))]
+        let cache_dir = ProjectDirs::from("org", "ShowMeFire", "Field")
             .map(|d| d.cache_dir().join("smf-data"))
             .unwrap_or_else(|| std::env::temp_dir().join("smf-field-data"));
-        let prefs_path = dirs
-            .as_ref()
-            .map(|d| d.config_dir().join("smf_prefs.json"))
-            .unwrap_or_else(|| std::env::temp_dir().join("smf-field-prefs.json"));
-        let mut prefs: Prefs = std::fs::read_to_string(&prefs_path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
+        // Browsers have no folders; the data cache is simply not kept there.
+        #[cfg(target_arch = "wasm32")]
+        let cache_dir = PathBuf::new();
+        let mut prefs: Prefs = crate::store::load_json("smf_prefs.json");
         if !prefs.initialized {
             // First run: show the incident picture and the fire-danger raster without any setup.
             prefs = Prefs {
@@ -164,8 +157,6 @@ impl SmfState {
             info: None,
             pending_rasters: prefs.rasters.clone(),
             prefs,
-            prefs_path,
-            cache_dir,
             cond_rx,
             cond_tx,
             cond_inflight: false,
@@ -187,18 +178,12 @@ impl SmfState {
             .filter(|k| self.layers[k].enabled)
             .map(|k| k.id().to_owned())
             .collect();
-        if let Some(d) = self.prefs_path.parent() {
-            let _ = std::fs::create_dir_all(d);
-        }
-        if let Ok(b) = serde_json::to_vec_pretty(&self.prefs) {
-            let _ = std::fs::write(&self.prefs_path, b);
-        }
+        crate::store::save_json("smf_prefs.json", &self.prefs);
     }
 
     /// Show the last catalog immediately (works offline), then refresh it from the server.
     fn load_catalog(&mut self, ctx: &egui::Context) {
-        let cache = self.cache_dir.join("catalog.json");
-        if let Some(text) = std::fs::read_to_string(&cache).ok()
+        if let Some(text) = crate::store::read_cache("catalog.json")
             && let Ok(c) = parse_catalog(&text)
         {
             self.catalog = c;
@@ -209,9 +194,8 @@ impl SmfState {
             return;
         };
         let (tx, ctx) = (self.catalog_tx.clone(), ctx.clone());
-        std::thread::spawn(move || {
-            let r = client
-                .get_text("/api/conditions/layers")
+        client.get_text("/api/conditions/layers", move |r| {
+            let r = r
                 .map_err(|e| e.to_string())
                 .and_then(|t| parse_catalog(&t).map_err(|e| e.to_string()).map(|c| (c, t)));
             let _ = tx.send(r);
@@ -224,8 +208,8 @@ impl SmfState {
             return;
         };
         let (tx, ctx) = (self.forecast_tx.clone(), ctx.clone());
-        std::thread::spawn(move || {
-            let r = match client.get("/api/forecast/v1/runs/latest", None) {
+        client.get("/api/forecast/v1/runs/latest", None, move |r| {
+            let r = match r {
                 Ok(smf_data::Fetched::Body { text, .. }) => parse_forecast_run(&text)
                     .map(Some)
                     .map_err(|e| e.to_string()),
@@ -280,6 +264,9 @@ fn color(c: [u8; 3]) -> Color32 {
 impl MapPanel {
     /// Called once per frame before drawing: apply background results and drive the forecast player.
     pub(crate) fn poll_smf(&mut self, ctx: &egui::Context) {
+        if let Some(r) = &self.smf.refresher {
+            r.tick();
+        }
         while let Some(u) = self.smf.refresher.as_ref().and_then(Refresher::try_recv) {
             match u {
                 Update::Loaded {
@@ -312,8 +299,7 @@ impl MapPanel {
         while let Ok(r) = self.smf.catalog_rx.try_recv() {
             match r {
                 Ok((cat, text)) => {
-                    let _ = std::fs::create_dir_all(&self.smf.cache_dir);
-                    let _ = std::fs::write(self.smf.cache_dir.join("catalog.json"), text);
+                    crate::store::write_cache("catalog.json", &text);
                     self.smf.catalog = cat;
                     self.smf.catalog_status = format!("{} layers", self.smf.catalog.len());
                 }
@@ -779,16 +765,13 @@ impl MapPanel {
         self.smf.cond_inflight = true;
         self.smf.cond_last = Some(ll);
         let (tx, ctx2) = (self.smf.cond_tx.clone(), ctx.clone());
-        std::thread::spawn(move || {
-            let r = client
-                .get_text(&format!(
-                    "/api/conditions/at?lat={:.5}&lon={:.5}",
-                    ll.lat, ll.lng
-                ))
-                .map_err(|e| e.to_string());
-            let _ = tx.send((ll, r));
-            ctx2.request_repaint();
-        });
+        client.get_text(
+            &format!("/api/conditions/at?lat={:.5}&lon={:.5}", ll.lat, ll.lng),
+            move |r| {
+                let _ = tx.send((ll, r.map_err(|e| e.to_string())));
+                ctx2.request_repaint();
+            },
+        );
     }
 
     /// Colour keys for every visible Show Me Fire raster, drawn in the map's top-left corner.

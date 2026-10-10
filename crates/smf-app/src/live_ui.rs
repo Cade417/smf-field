@@ -4,13 +4,11 @@
 
 use crate::map_panel::MapPanel;
 use crate::overlay::{self, Projector};
-use directories::ProjectDirs;
 use eframe::egui::{self, Align2, Color32, Stroke};
 use serde::{Deserialize, Serialize};
 use smf_geo::LngLat;
 use smf_live::{Event, Handle, LiveSource, Network, Report};
 use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
 
 const MAX_TRAIL: usize = 80;
 /// Beyond this a marker is shown greyed: it is where the person was, not where they are.
@@ -91,26 +89,18 @@ pub struct LiveState {
     running: Vec<Running>,
     stations: HashMap<(Network, String), Station>,
     add: Option<AddForm>,
-    path: PathBuf,
     /// Verification hook (SMF_LIVE): start this source on the first frame.
     pub dev_source: Option<Cfg>,
 }
 
 impl LiveState {
     pub fn new() -> Self {
-        let path = ProjectDirs::from("org", "ShowMeFire", "Field")
-            .map(|d| d.config_dir().join("live.json"))
-            .unwrap_or_else(|| std::env::temp_dir().join("smf-field-live.json"));
-        let cfgs: Vec<Cfg> = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
+        let cfgs: Vec<Cfg> = crate::store::load_json("live.json");
         let mut s = Self {
             cfgs,
             running: vec![],
             stations: HashMap::new(),
             add: None,
-            path,
             dev_source: None,
         };
         for i in 0..s.cfgs.len() {
@@ -122,12 +112,7 @@ impl LiveState {
     }
 
     fn save(&self) {
-        if let Some(d) = self.path.parent() {
-            let _ = std::fs::create_dir_all(d);
-        }
-        if let Ok(b) = serde_json::to_vec_pretty(&self.cfgs) {
-            let _ = std::fs::write(&self.path, b);
-        }
+        crate::store::save_json("live.json", &self.cfgs);
     }
 
     fn start(&mut self, i: usize) {
@@ -517,7 +502,6 @@ mod tests {
             running: vec![],
             stations: HashMap::new(),
             add: None,
-            path: std::env::temp_dir().join("smf-live-test-never-written.json"),
             dev_source: None,
         }
     }

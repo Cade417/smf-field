@@ -1,13 +1,18 @@
-//! Background threads that keep a shared map and teammate positions live: a poller that
-//! long-polls the server for news, and a writer that sends our changes and position.
-//! They are separate so a long wait for news never delays our own edits.
+//! Keeps a shared map and teammate positions live without any background threads of its own.
+//!
+//! The session is driven by `Handle::tick()`, which the app calls every frame: it starts the
+//! next long poll for news, sends queued edits and position reports, and honours back-off after
+//! errors. Requests complete through callbacks (a short-lived thread each on desktop, the
+//! browser's fetch on the web) that update shared state and ask for a repaint via `wake`, so
+//! the same code runs in both places. Timing uses `web_time`, which works on the web too.
 
 use crate::client::{Events, FieldClient, Position, SyncError};
 use crate::engine::LocalOp;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::collections::VecDeque;
 use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use web_time::Instant;
 
 const WAIT_SECS: u64 = 20;
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
@@ -34,33 +39,196 @@ pub enum Update {
         error: SyncError,
     },
     Status(String),
-    /// Credentials stopped working: the workers have exited.
+    /// Credentials stopped working: the session has ended.
     LoggedOut(String),
 }
 
+struct Inner {
+    stopped: bool,
+    /// Waiting for the app to reload the map after a reset.
+    paused: bool,
+    rev: u64,
+    pos_since: u64,
+    poll_in_flight: bool,
+    next_poll: Instant,
+    backoff: Duration,
+    queue: VecDeque<LocalOp>,
+    push_in_flight: bool,
+    pending_pos: Option<Position>,
+    clear_pos: bool,
+    pos_in_flight: bool,
+}
+
 pub struct Handle {
-    tx: Sender<Command>,
+    client: FieldClient,
+    map_id: Option<String>,
+    inner: Arc<Mutex<Inner>>,
+    up: Sender<Update>,
     pub rx: Receiver<Update>,
-    stop: Arc<AtomicBool>,
-    /// While the poller waits for the app to reload the map after a reset.
-    paused: Arc<AtomicBool>,
-    since_rev: Arc<AtomicU64>,
+    wake: Arc<dyn Fn() + Send + Sync>,
 }
 
 impl Handle {
     pub fn send(&self, c: Command) {
-        let _ = self.tx.send(c);
+        let Ok(mut g) = self.inner.lock() else { return };
+        match c {
+            Command::Push(ops) => g.queue.extend(ops),
+            Command::Position(p) => {
+                g.pending_pos = Some(p);
+                g.clear_pos = false;
+            }
+            Command::ClearPosition => {
+                g.pending_pos = None;
+                g.clear_pos = true;
+            }
+        }
     }
 
     /// After reloading the whole map (reset), continue from its revision.
     pub fn resume_from(&self, rev: u64) {
-        self.since_rev.store(rev, Ordering::SeqCst);
-        self.paused.store(false, Ordering::SeqCst);
+        if let Ok(mut g) = self.inner.lock() {
+            g.rev = rev;
+            g.paused = false;
+        }
     }
 
     pub fn stop(&self) {
-        self.stop.store(true, Ordering::Relaxed);
-        self.paused.store(false, Ordering::Relaxed);
+        if let Ok(mut g) = self.inner.lock() {
+            g.stopped = true;
+        }
+    }
+
+    /// Start whatever request is due. Cheap; call it every frame.
+    pub fn tick(&self) {
+        let now = Instant::now();
+        let (poll, push, pos, clear) = {
+            let Ok(mut g) = self.inner.lock() else { return };
+            if g.stopped {
+                return;
+            }
+            let poll = (!g.paused && !g.poll_in_flight && now >= g.next_poll)
+                .then(|| (g.rev, g.pos_since));
+            if poll.is_some() {
+                g.poll_in_flight = true;
+            }
+            let mut push = None;
+            if self.map_id.is_some() && !g.push_in_flight && !g.queue.is_empty() {
+                let n = g.queue.len().min(OPS_PER_REQUEST);
+                push = Some(g.queue.drain(..n).collect::<Vec<_>>());
+                g.push_in_flight = true;
+            }
+            let mut pos = None;
+            if !g.pos_in_flight
+                && let Some(p) = g.pending_pos.take()
+            {
+                pos = Some(p);
+                g.pos_in_flight = true;
+            }
+            let mut clear = false;
+            if !g.pos_in_flight && g.clear_pos {
+                g.clear_pos = false;
+                g.pos_in_flight = true;
+                clear = true;
+            }
+            (poll, push, pos, clear)
+        };
+
+        if let Some((since, pos_since)) = poll {
+            let (inner, up, wake) = (self.inner.clone(), self.up.clone(), self.wake.clone());
+            self.client.events(
+                self.map_id.as_deref(),
+                since,
+                pos_since,
+                WAIT_SECS,
+                move |r| {
+                    if let Ok(mut g) = inner.lock() {
+                        g.poll_in_flight = false;
+                        match r {
+                            Ok(ev) => {
+                                g.backoff = Duration::from_secs(2);
+                                g.next_poll = Instant::now();
+                                // A reload may have moved the cursor while we waited: drop stale news.
+                                if g.rev == since {
+                                    g.pos_since = g.pos_since.max(ev.pos_seq);
+                                    if ev.reset {
+                                        g.paused = true;
+                                    } else {
+                                        g.rev = ev.rev.max(since);
+                                    }
+                                    if ev.reset || !ev.ops.is_empty() || !ev.positions.is_empty() {
+                                        let _ = up.send(Update::Events(ev));
+                                    }
+                                }
+                            }
+                            Err(SyncError::Auth(m)) => {
+                                g.stopped = true;
+                                let _ = up.send(Update::LoggedOut(m));
+                            }
+                            Err(e) => {
+                                let _ = up.send(Update::Status(format!("{e}; retrying")));
+                                g.next_poll = Instant::now() + g.backoff;
+                                g.backoff = (g.backoff * 2).min(MAX_BACKOFF);
+                            }
+                        }
+                    }
+                    wake();
+                },
+            );
+        }
+
+        if let (Some(ops), Some(map)) = (push, self.map_id.as_deref()) {
+            let uids: Vec<String> = ops.iter().map(|o| o.uid().to_string()).collect();
+            let (inner, up, wake) = (self.inner.clone(), self.up.clone(), self.wake.clone());
+            self.client.post_ops(map, &ops, move |r| {
+                if let Ok(mut g) = inner.lock() {
+                    g.push_in_flight = false;
+                    match r {
+                        Ok(rev) => {
+                            let _ = up.send(Update::Pushed { uids, rev });
+                        }
+                        Err(SyncError::Auth(m)) => {
+                            g.stopped = true;
+                            let _ = up.send(Update::LoggedOut(m));
+                        }
+                        Err(error) => {
+                            let _ = up.send(Update::PushFailed { uids, error });
+                        }
+                    }
+                }
+                wake();
+            });
+        }
+
+        if let Some(p) = pos {
+            let (inner, up, wake) = (self.inner.clone(), self.up.clone(), self.wake.clone());
+            self.client.post_position(&p, move |r| {
+                if let Ok(mut g) = inner.lock() {
+                    g.pos_in_flight = false;
+                    match r {
+                        // Sending faster than once a second is refused; the next report replaces it.
+                        Ok(()) | Err(SyncError::Server { status: 429, .. }) => {}
+                        Err(SyncError::Auth(m)) => {
+                            g.stopped = true;
+                            let _ = up.send(Update::LoggedOut(m));
+                        }
+                        Err(e) => {
+                            let _ = up.send(Update::Status(format!("position not sent: {e}")));
+                        }
+                    }
+                }
+                wake();
+            });
+        }
+
+        if clear {
+            let (inner, wake) = (self.inner.clone(), self.wake.clone());
+            self.client.clear_position(move |_| {
+                if let Ok(mut g) = inner.lock() {
+                    g.pos_in_flight = false;
+                }
+                wake();
+            });
+        }
     }
 }
 
@@ -70,154 +238,35 @@ impl Drop for Handle {
     }
 }
 
-fn sleep_unless(stop: &AtomicBool, d: Duration) {
-    let mut waited = Duration::ZERO;
-    while waited < d && !stop.load(Ordering::Relaxed) {
-        std::thread::sleep(Duration::from_millis(100));
-        waited += Duration::from_millis(100);
-    }
-}
-
-/// Start the workers for `map_id` (None: positions only) from the given cursors.
+/// Start a session for `map_id` (None: positions only) from the given cursors. `wake` is called
+/// whenever something completes, so the UI can repaint and tick again.
 pub fn spawn(
     client: FieldClient,
     map_id: Option<String>,
     since_rev: u64,
     pos_since: u64,
+    wake: impl Fn() + Send + Sync + 'static,
 ) -> Handle {
-    let (cmd_tx, cmd_rx) = channel::<Command>();
-    let (up_tx, up_rx) = channel::<Update>();
-    let stop = Arc::new(AtomicBool::new(false));
-    let paused = Arc::new(AtomicBool::new(false));
-    let rev = Arc::new(AtomicU64::new(since_rev));
-
-    // Poller
-    {
-        let (client, up, stop, paused, rev, map_id) = (
-            client.clone(),
-            up_tx.clone(),
-            stop.clone(),
-            paused.clone(),
-            rev.clone(),
-            map_id.clone(),
-        );
-        std::thread::spawn(move || {
-            let mut pos_since = pos_since;
-            let mut backoff = Duration::from_secs(2);
-            while !stop.load(Ordering::Relaxed) {
-                if paused.load(Ordering::SeqCst) {
-                    std::thread::sleep(Duration::from_millis(100));
-                    continue;
-                }
-                let since = rev.load(Ordering::SeqCst);
-                match client.events(map_id.as_deref(), since, pos_since, WAIT_SECS) {
-                    Ok(ev) => {
-                        backoff = Duration::from_secs(2);
-                        // A reload may have moved the cursor while we waited: drop stale news.
-                        if rev.load(Ordering::SeqCst) != since {
-                            continue;
-                        }
-                        pos_since = pos_since.max(ev.pos_seq);
-                        if ev.reset {
-                            paused.store(true, Ordering::SeqCst);
-                        } else {
-                            rev.store(ev.rev.max(since), Ordering::SeqCst);
-                        }
-                        if ev.reset || !ev.ops.is_empty() || !ev.positions.is_empty() {
-                            let _ = up.send(Update::Events(ev));
-                        }
-                    }
-                    Err(SyncError::Auth(m)) => {
-                        let _ = up.send(Update::LoggedOut(m));
-                        stop.store(true, Ordering::Relaxed);
-                    }
-                    Err(e) => {
-                        let _ = up.send(Update::Status(format!("{e}; retrying")));
-                        sleep_unless(&stop, backoff);
-                        backoff = (backoff * 2).min(MAX_BACKOFF);
-                    }
-                }
-            }
-        });
-    }
-
-    // Writer
-    {
-        let (up, stop) = (up_tx, stop.clone());
-        let map_id = map_id.clone();
-        std::thread::spawn(move || {
-            let mut pending_pos: Option<Position> = None;
-            let mut clear = false;
-            while !stop.load(Ordering::Relaxed) {
-                // Gather what is waiting; only the newest position matters.
-                let mut pushes: Vec<LocalOp> = vec![];
-                match cmd_rx.recv_timeout(Duration::from_millis(300)) {
-                    Ok(c) => {
-                        let mut next = Some(c);
-                        while let Some(c) = next.take() {
-                            match c {
-                                Command::Push(mut v) => pushes.append(&mut v),
-                                Command::Position(p) => {
-                                    pending_pos = Some(p);
-                                    clear = false;
-                                }
-                                Command::ClearPosition => {
-                                    pending_pos = None;
-                                    clear = true;
-                                }
-                            }
-                            next = cmd_rx.try_recv().ok();
-                        }
-                    }
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-                }
-                if let Some(m) = &map_id {
-                    for chunk in pushes.chunks(OPS_PER_REQUEST) {
-                        let uids: Vec<String> = chunk.iter().map(|o| o.uid().to_string()).collect();
-                        match client.post_ops(m, chunk) {
-                            Ok(rev) => {
-                                let _ = up.send(Update::Pushed { uids, rev });
-                            }
-                            Err(SyncError::Auth(msg)) => {
-                                let _ = up.send(Update::LoggedOut(msg));
-                                stop.store(true, Ordering::Relaxed);
-                                return;
-                            }
-                            Err(error) => {
-                                let _ = up.send(Update::PushFailed { uids, error });
-                            }
-                        }
-                    }
-                }
-                if let Some(p) = pending_pos.take() {
-                    match client.post_position(&p) {
-                        Ok(()) => {}
-                        // Sending faster than once a second is refused; the next report replaces it.
-                        Err(SyncError::Server { status: 429, .. }) => {}
-                        Err(SyncError::Auth(msg)) => {
-                            let _ = up.send(Update::LoggedOut(msg));
-                            stop.store(true, Ordering::Relaxed);
-                            return;
-                        }
-                        Err(e) => {
-                            let _ = up.send(Update::Status(format!("position not sent: {e}")));
-                        }
-                    }
-                }
-                if clear {
-                    clear = false;
-                    let _ = client.clear_position();
-                }
-            }
-        });
-    }
-
+    let (up, rx) = channel::<Update>();
     Handle {
-        tx: cmd_tx,
-        rx: up_rx,
-        stop,
-        paused,
-        since_rev: rev,
+        client,
+        map_id,
+        inner: Arc::new(Mutex::new(Inner {
+            stopped: false,
+            paused: false,
+            rev: since_rev,
+            pos_since,
+            poll_in_flight: false,
+            next_poll: Instant::now(),
+            backoff: Duration::from_secs(2),
+            queue: VecDeque::new(),
+            push_in_flight: false,
+            pending_pos: None,
+            clear_pos: false,
+            pos_in_flight: false,
+        })),
+        up,
+        rx,
+        wake: Arc::new(wake),
     }
 }

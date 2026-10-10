@@ -1,7 +1,8 @@
-//! HTTP client for the Show Me Fire Field collaboration API.
+//! HTTP client for the Show Me Fire Field collaboration API (callback style, see `smf-net`).
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use smf_net::{Method, Request};
 use std::collections::BTreeMap;
 use std::time::Duration;
 
@@ -9,7 +10,7 @@ use std::time::Duration;
 pub enum SyncError {
     /// 401: the token is missing, wrong or was revoked.
     Auth(String),
-    /// Any other refusal, with the server's explanation.
+    /// Any other refusal, with the server's explanation (402 means the plan is not active).
     Server {
         status: u16,
         message: String,
@@ -175,7 +176,6 @@ pub struct Position {
 pub struct FieldClient {
     base: String,
     token: Option<String>,
-    http: reqwest::blocking::Client,
 }
 
 impl std::fmt::Debug for FieldClient {
@@ -187,6 +187,41 @@ impl std::fmt::Debug for FieldClient {
 
 const API: &str = "/api/field/v1";
 
+/// Turn a finished request into a JSON value or a classified error.
+fn classify(r: Result<smf_net::Response, String>) -> Result<Value, SyncError> {
+    let resp = r.map_err(SyncError::Network)?;
+    let text = resp.text();
+    if resp.ok() {
+        if text.trim().is_empty() {
+            return Ok(Value::Null);
+        }
+        return serde_json::from_str(&text).map_err(|e| SyncError::Parse(e.to_string()));
+    }
+    let detail = serde_json::from_str::<Value>(&text)
+        .ok()
+        .and_then(|v| {
+            v.get("detail").map(|d| match d {
+                Value::String(s) => s.clone(),
+                // Validation errors come back as a list; the first message is enough.
+                other => other
+                    .get(0)
+                    .and_then(|e| e.get("msg"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("invalid request")
+                    .to_string(),
+            })
+        })
+        .unwrap_or_else(|| format!("the server answered {}", resp.status));
+    if resp.status == 401 {
+        Err(SyncError::Auth(detail))
+    } else {
+        Err(SyncError::Server {
+            status: resp.status,
+            message: detail,
+        })
+    }
+}
+
 impl FieldClient {
     pub fn new(base: &str, token: Option<String>) -> Result<Self, SyncError> {
         let base = base.trim().trim_end_matches('/').to_string();
@@ -195,63 +230,35 @@ impl FieldClient {
                 "the server address must start with http:// or https://".into(),
             ));
         }
-        let http = reqwest::blocking::Client::builder()
-            .user_agent(concat!("ShowMeFireField/", env!("CARGO_PKG_VERSION")))
-            .timeout(Duration::from_secs(20))
-            .build()
-            .map_err(|e| SyncError::Network(e.to_string()))?;
-        Ok(Self { base, token, http })
-    }
-
-    fn send(&self, req: reqwest::blocking::RequestBuilder) -> Result<Value, SyncError> {
-        let req = match &self.token {
-            Some(t) => req.bearer_auth(t),
-            None => req,
-        };
-        let resp = req
-            .send()
-            .map_err(|e| SyncError::Network(e.without_url().to_string()))?;
-        let status = resp.status().as_u16();
-        let text = resp
-            .text()
-            .map_err(|e| SyncError::Network(e.without_url().to_string()))?;
-        if (200..300).contains(&status) {
-            if text.trim().is_empty() {
-                return Ok(Value::Null);
-            }
-            return serde_json::from_str(&text).map_err(|e| SyncError::Parse(e.to_string()));
-        }
-        let detail = serde_json::from_str::<Value>(&text)
-            .ok()
-            .and_then(|v| {
-                v.get("detail").map(|d| match d {
-                    Value::String(s) => s.clone(),
-                    // Validation errors come back as a list; the first message is enough.
-                    other => other
-                        .get(0)
-                        .and_then(|e| e.get("msg"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("invalid request")
-                        .to_string(),
-                })
-            })
-            .unwrap_or_else(|| format!("the server answered {status}"));
-        if status == 401 {
-            Err(SyncError::Auth(detail))
-        } else {
-            Err(SyncError::Server {
-                status,
-                message: detail,
-            })
-        }
-    }
-
-    fn parse<T: for<'de> Deserialize<'de>>(v: Value) -> Result<T, SyncError> {
-        serde_json::from_value(v).map_err(|e| SyncError::Parse(e.to_string()))
+        Ok(Self { base, token })
     }
 
     fn url(&self, path: &str) -> String {
         format!("{}{API}{path}", self.base)
+    }
+
+    fn req(&self, method: Method, path: &str) -> Request {
+        let r = Request::new(method, self.url(path)).timeout(Duration::from_secs(20));
+        match &self.token {
+            Some(t) => r.bearer(t),
+            None => r,
+        }
+    }
+
+    fn call<T: for<'de> Deserialize<'de> + Send + 'static>(
+        &self,
+        req: Request,
+        done: impl FnOnce(Result<T, SyncError>) + Send + 'static,
+    ) {
+        smf_net::fetch(req, move |r| {
+            done(classify(r).and_then(|v| {
+                serde_json::from_value(v).map_err(|e| SyncError::Parse(e.to_string()))
+            }))
+        });
+    }
+
+    fn call_unit(&self, req: Request, done: impl FnOnce(Result<(), SyncError>) + Send + 'static) {
+        smf_net::fetch(req, move |r| done(classify(r).map(|_| ())));
     }
 
     /// Create a team. `credential` is a Show Me Fire account token (`fldacct_...`), which
@@ -261,107 +268,148 @@ impl FieldClient {
         credential: &str,
         team: &str,
         display: &str,
-    ) -> Result<Creds, SyncError> {
+        done: impl FnOnce(Result<Creds, SyncError>) + Send + 'static,
+    ) {
         let credential = credential.trim();
-        let req = self.http.post(self.url("/teams"));
-        let req = if credential.starts_with("fldacct_") {
-            req.bearer_auth(credential)
+        let mut req = Request::new(Method::Post, self.url("/teams"));
+        req = if credential.starts_with("fldacct_") {
+            req.bearer(credential)
         } else {
             req.header("X-Field-Create-Key", credential)
         };
-        Self::parse(self.send(req.json(&json!({"team_name": team, "display_name": display})))?)
+        self.call(
+            req.json_body(&json!({"team_name": team, "display_name": display}).to_string()),
+            done,
+        );
     }
 
-    pub fn join(&self, code: &str, display: &str) -> Result<Creds, SyncError> {
-        let r = self
-            .http
-            .post(self.url("/teams/join"))
-            .json(&json!({"join_code": code, "display_name": display}));
-        Self::parse(self.send(r)?)
+    pub fn join(
+        &self,
+        code: &str,
+        display: &str,
+        done: impl FnOnce(Result<Creds, SyncError>) + Send + 'static,
+    ) {
+        let req = Request::new(Method::Post, self.url("/teams/join"))
+            .json_body(&json!({"join_code": code, "display_name": display}).to_string());
+        self.call(req, done);
     }
 
-    pub fn me(&self) -> Result<Me, SyncError> {
-        Self::parse(self.send(self.http.get(self.url("/me")))?)
+    pub fn me(&self, done: impl FnOnce(Result<Me, SyncError>) + Send + 'static) {
+        self.call(self.req(Method::Get, "/me"), done);
     }
 
-    pub fn list_maps(&self) -> Result<Vec<MapInfo>, SyncError> {
-        let v = self.send(self.http.get(self.url("/maps")))?;
-        Self::parse(v.get("maps").cloned().unwrap_or(Value::Null))
+    pub fn list_maps(&self, done: impl FnOnce(Result<Vec<MapInfo>, SyncError>) + Send + 'static) {
+        #[derive(Deserialize)]
+        struct Maps {
+            maps: Vec<MapInfo>,
+        }
+        self.call(
+            self.req(Method::Get, "/maps"),
+            move |r: Result<Maps, SyncError>| done(r.map(|m| m.maps)),
+        );
     }
 
     pub fn create_map(
         &self,
         name: &str,
         features: &BTreeMap<String, Value>,
-    ) -> Result<MapInfo, SyncError> {
-        let r = self
-            .http
-            .post(self.url("/maps"))
-            .json(&json!({"name": name, "features": features}));
-        Self::parse(self.send(r)?)
+        done: impl FnOnce(Result<MapInfo, SyncError>) + Send + 'static,
+    ) {
+        let body = json!({"name": name, "features": features}).to_string();
+        self.call(self.req(Method::Post, "/maps").json_body(&body), done);
     }
 
-    pub fn get_map(&self, id: &str) -> Result<MapDoc, SyncError> {
-        Self::parse(self.send(self.http.get(self.url(&format!("/maps/{id}"))))?)
+    pub fn get_map(&self, id: &str, done: impl FnOnce(Result<MapDoc, SyncError>) + Send + 'static) {
+        self.call(self.req(Method::Get, &format!("/maps/{id}")), done);
     }
 
-    /// Returns the map's new revision.
-    pub fn post_ops(&self, map_id: &str, ops: &[crate::LocalOp]) -> Result<u64, SyncError> {
+    /// Replies with the map's new revision.
+    pub fn post_ops(
+        &self,
+        map_id: &str,
+        ops: &[crate::LocalOp],
+        done: impl FnOnce(Result<u64, SyncError>) + Send + 'static,
+    ) {
         let body: Vec<Value> = ops.iter().map(crate::LocalOp::to_json).collect();
-        let r = self
-            .http
-            .post(self.url(&format!("/maps/{map_id}/ops")))
-            .json(&json!({"ops": body}));
-        let v = self.send(r)?;
-        v.get("rev")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| SyncError::Parse("no revision in reply".into()))
+        let req = self
+            .req(Method::Post, &format!("/maps/{map_id}/ops"))
+            .json_body(&json!({"ops": body}).to_string());
+        smf_net::fetch(req, move |r| {
+            done(classify(r).and_then(|v| {
+                v.get("rev")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| SyncError::Parse("no revision in reply".into()))
+            }))
+        });
     }
 
-    /// Long poll: returns as soon as there is news, or empty after `wait_secs` (max 25).
+    /// Long poll: replies as soon as there is news, or empty after `wait_secs` (max 25).
     pub fn events(
         &self,
         map_id: Option<&str>,
         since: u64,
         pos_since: u64,
         wait_secs: u64,
-    ) -> Result<Events, SyncError> {
+        done: impl FnOnce(Result<Events, SyncError>) + Send + 'static,
+    ) {
+        let wait = wait_secs.min(25);
         let mut q: Vec<(&str, String)> = vec![
             ("since", since.to_string()),
             ("pos_since", pos_since.to_string()),
-            ("wait", wait_secs.min(25).to_string()),
+            ("wait", wait.to_string()),
         ];
         if let Some(m) = map_id {
             q.push(("map_id", m.to_string()));
         }
-        let r = self
-            .http
-            .get(self.url("/events"))
+        let req = self
+            .req(Method::Get, "/events")
             .query(&q)
-            .timeout(Duration::from_secs(wait_secs.min(25) + 15));
-        Self::parse(self.send(r)?)
+            .timeout(Duration::from_secs(wait + 15));
+        self.call(req, done);
     }
 
-    pub fn post_position(&self, p: &Position) -> Result<(), SyncError> {
-        self.send(self.http.post(self.url("/positions")).json(p))
-            .map(|_| ())
+    pub fn post_position(
+        &self,
+        p: &Position,
+        done: impl FnOnce(Result<(), SyncError>) + Send + 'static,
+    ) {
+        let body = serde_json::to_string(p).unwrap_or_default();
+        self.call_unit(self.req(Method::Post, "/positions").json_body(&body), done);
     }
 
-    pub fn clear_position(&self) -> Result<(), SyncError> {
-        self.send(self.http.delete(self.url("/positions")))
-            .map(|_| ())
+    pub fn clear_position(&self, done: impl FnOnce(Result<(), SyncError>) + Send + 'static) {
+        self.call_unit(self.req(Method::Delete, "/positions"), done);
     }
 
-    pub fn new_join_code(&self) -> Result<String, SyncError> {
-        let v = self.send(self.http.post(self.url("/teams/join-code")))?;
-        v.get("join_code")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .ok_or_else(|| SyncError::Parse("no join code in reply".into()))
+    pub fn new_join_code(&self, done: impl FnOnce(Result<String, SyncError>) + Send + 'static) {
+        smf_net::fetch(self.req(Method::Post, "/teams/join-code"), move |r| {
+            done(classify(r).and_then(|v| {
+                v.get("join_code")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .ok_or_else(|| SyncError::Parse("no join code in reply".into()))
+            }))
+        });
     }
 
-    pub fn remove_member(&self, id: &str) -> Result<(), SyncError> {
-        self.send(self.http.delete(self.url(&format!("/members/{id}"))))
-            .map(|_| ())
+    pub fn remove_member(
+        &self,
+        id: &str,
+        done: impl FnOnce(Result<(), SyncError>) + Send + 'static,
+    ) {
+        self.call_unit(self.req(Method::Delete, &format!("/members/{id}")), done);
     }
+}
+
+/// Run a callback-style call and wait for its result. For tests and tools; browsers cannot block.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn wait_blocking<T: Send + 'static>(
+    start: impl FnOnce(Box<dyn FnOnce(Result<T, SyncError>) + Send>),
+) -> Result<T, SyncError> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    start(Box::new(move |r| {
+        let _ = tx.send(r);
+    }));
+    rx.recv()
+        .unwrap_or_else(|_| Err(SyncError::Network("no reply".into())))
 }

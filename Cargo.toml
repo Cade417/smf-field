@@ -25,6 +25,7 @@ smf-route = { path = "crates/smf-route" }
 smf-gps = { path = "crates/smf-gps" }
 smf-live = { path = "crates/smf-live" }
 smf-sync = { path = "crates/smf-sync" }
+smf-net = { path = "crates/smf-net" }
 eframe = { version = "0.36", default-features = false, features = ["wgpu", "default_fonts", "wayland", "x11", "accesskit"] }
 anyhow = "1"
 thiserror = "2"
