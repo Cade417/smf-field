@@ -119,3 +119,10 @@ non-interactive run suppress modal dialogs.
 - Installer packaging (`[package.metadata.packager]`) and the release workflow are configured but
   have not been exercised on clean machines; signed installers are not produced.
 - Update checks are opt-in (`SMF_UPDATE_URL`).
+
+## Licence and accounts
+
+Free to use and modify, not for redistribution or sale; the software belongs to Show Me Fire. See
+[LICENSE](LICENSE), [NOTICE.md](NOTICE.md) (plain-language summary, what is free and what needs an
+account) and [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md). Everything local and all public
+data is free with no account; team maps and shared positions need a team owner on a paid plan.
